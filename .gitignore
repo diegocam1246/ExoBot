@@ -1,0 +1,7 @@
+.env
+service_account.json
+reminders.db
+__pycache__/
+*.pyc
+venv/
+.venv/

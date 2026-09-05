@@ -132,6 +132,8 @@ def get_db():
         conn.execute("ALTER TABLE settings ADD COLUMN event_announcement TEXT")
     if "birthday_message" not in existing_settings_cols:
         conn.execute("ALTER TABLE settings ADD COLUMN birthday_message TEXT")
+    if "event_reminder" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN event_reminder TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pending_event_notifies (
             guild_id INTEGER,
@@ -165,6 +167,18 @@ def get_birthday_message_template(guild_id: int) -> str:
     ).fetchone()
     conn.close()
     return row[0] if row and row[0] else DEFAULT_BIRTHDAY_MESSAGE
+
+
+DEFAULT_EVENT_REMINDER = "📅 Reminder: **{name}** is today!"
+
+
+def get_event_reminder_template(guild_id: int) -> str:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT event_reminder FROM settings WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else DEFAULT_EVENT_REMINDER
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +845,22 @@ async def removementionall(interaction: discord.Interaction, notify: str):
     )
 
 
+@bot.tree.command(description="Set the day-of event reminder message (use {name}, {notify})")
+@app_commands.checks.has_permissions(administrator=True)
+async def seteventreminder(interaction: discord.Interaction, template: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (guild_id, event_reminder) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET event_reminder = excluded.event_reminder",
+        (interaction.guild_id, template),
+    )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"Event reminders will now use:\n> {template}", ephemeral=True
+    )
+
+
 @bot.tree.command(description="List all upcoming events")
 async def events(interaction: discord.Interaction):
     conn = get_db()
@@ -948,18 +978,28 @@ async def daily_check():
                 birthday_template = get_birthday_message_template(guild.id)
             messages.append(birthday_template.replace("{member}", f"<@{user_id}>"))
 
+        event_template = None
+
         for name, notify_user_ids, calendar_key in conn.execute(
             "SELECT name, notify_user_ids, calendar_key FROM events WHERE guild_id = ? AND month = ? AND day = ? "
             "AND (year = ? OR year IS NULL)",
             (guild.id, today.month, today.day, today.year),
         ):
-            line = f"📅 Reminder: **{name}** is today!"
-            if notify_user_ids:
-                line += f" {notify_user_ids}"
-            else:
+            if event_template is None:
+                event_template = get_event_reminder_template(guild.id)
+
+            mention = notify_user_ids
+            if not mention:
                 role = find_calendar_role(guild, calendar_key)
-                if role:
-                    line += f" {role.mention}"
+                mention = role.mention if role else ""
+
+            text = event_template.replace("{name}", name)
+            if "{notify}" in text:
+                line = text.replace("{notify}", mention)
+            elif mention:
+                line = f"{text} {mention}"
+            else:
+                line = text
             messages.append(line)
 
         if messages:

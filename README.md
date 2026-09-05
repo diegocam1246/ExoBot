@@ -200,8 +200,13 @@ be mistaken for everything on it having been deleted.
 ## 7. How reminders work
 Every day at `REMINDER_HOUR` (your local time, per `TIMEZONE`), the bot checks
 the database and posts to the configured channel:
-- `🎂 Happy Birthday @user!` for anyone whose birthday is today
-- `📅 Reminder: <event> is today!` for any matching event
+- `🎂 Happy Birthday @user!` for anyone whose birthday is today (customizable
+  per-server via `/setbirthdaymessage template:"..."`, using `{member}`)
+- `📅 Reminder: <event> is today!` for any matching event, with whoever's
+  concerned tagged after it (customizable per-server via
+  `/seteventreminder template:"..."`, using `{name}` and optionally
+  `{notify}` — if you don't include `{notify}`, the mention is just appended
+  after your message automatically, same as the default)
 
 ## 8. Deploying to Railway
 1. **Push to GitHub.** `.env` and `service_account.json` are already listed

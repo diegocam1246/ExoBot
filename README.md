@@ -43,10 +43,19 @@ permission to run)
 
 ## 5. Add birthdays and events
 ```
-/setbirthday month:6 day:15
-/setbirthday month:3 day:2 member:@someone
+/setbirthday month:6 day:15 member:@someone
 /birthdays
+```
+`member` is required — `/setbirthday` always sets a specific member's
+birthday, there's no "leave empty to set your own" shortcut.
 
+Customize the day-of birthday message per-server (defaults to
+`🎂 Happy Birthday {member}! 🎉`):
+```
+/setbirthdaymessage template:"🎉 Happy Birthday {member}, hope it's a great one!"
+```
+
+```
 /addevent name:"Team standup" month:9 day:10 notify:"@Chefs"        (uses the current year)
 /addevent name:"Anniversary" month:9 day:10 year:2027
 /addevent name:"Kickoff meeting" month:9 day:20 time:14:30 location:"Room A-201" notify:"@Alice @Bob"

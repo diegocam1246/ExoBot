@@ -130,6 +130,8 @@ def get_db():
     existing_settings_cols = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
     if "event_announcement" not in existing_settings_cols:
         conn.execute("ALTER TABLE settings ADD COLUMN event_announcement TEXT")
+    if "birthday_message" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN birthday_message TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pending_event_notifies (
             guild_id INTEGER,
@@ -151,6 +153,18 @@ def get_reminder_channel(guild_id: int):
     ).fetchone()
     conn.close()
     return row[0] if row else None
+
+
+DEFAULT_BIRTHDAY_MESSAGE = "🎂 Happy Birthday {member}! 🎉"
+
+
+def get_birthday_message_template(guild_id: int) -> str:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT birthday_message FROM settings WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else DEFAULT_BIRTHDAY_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -457,16 +471,14 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
 # Slash commands: birthdays
 # ---------------------------------------------------------------------------
 @bot.tree.command(description="Set a member's birthday (Administrator only)")
-@app_commands.describe(month="1-12", day="1-31", member="Leave empty to set your own")
+@app_commands.describe(month="1-12", day="1-31", member="Whose birthday this is")
 @app_commands.checks.has_permissions(administrator=True)
 async def setbirthday(
     interaction: discord.Interaction,
     month: app_commands.Range[int, 1, 12],
     day: app_commands.Range[int, 1, 31],
-    member: discord.Member = None,
+    member: discord.Member,
 ):
-    target = member or interaction.user
-
     try:
         datetime.date(2024, month, day)  # validate, 2024 = leap year so Feb 29 works
     except ValueError:
@@ -477,12 +489,12 @@ async def setbirthday(
     conn.execute(
         "INSERT INTO birthdays (guild_id, user_id, month, day) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(guild_id, user_id) DO UPDATE SET month=excluded.month, day=excluded.day",
-        (interaction.guild_id, target.id, month, day),
+        (interaction.guild_id, member.id, month, day),
     )
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Saved {target.display_name}'s birthday as {month:02d}/{day:02d}."
+        f"Saved {member.display_name}'s birthday as {month:02d}/{day:02d}."
     )
 
 
@@ -499,6 +511,22 @@ async def removebirthday(interaction: discord.Interaction, member: discord.Membe
     conn.commit()
     conn.close()
     await interaction.response.send_message(f"Removed {target.display_name}'s birthday.")
+
+
+@bot.tree.command(description="Set the day-of birthday message (use {member})")
+@app_commands.checks.has_permissions(administrator=True)
+async def setbirthdaymessage(interaction: discord.Interaction, template: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (guild_id, birthday_message) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET birthday_message = excluded.birthday_message",
+        (interaction.guild_id, template),
+    )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"Birthday messages will now use:\n> {template}", ephemeral=True
+    )
 
 
 @bot.tree.command(description="List all saved birthdays, soonest first")
@@ -910,12 +938,15 @@ async def daily_check():
             continue
 
         messages = []
+        birthday_template = None
 
         for user_id, in conn.execute(
             "SELECT user_id FROM birthdays WHERE guild_id = ? AND month = ? AND day = ?",
             (guild.id, today.month, today.day),
         ):
-            messages.append(f"🎂 Happy Birthday <@{user_id}>! 🎉")
+            if birthday_template is None:
+                birthday_template = get_birthday_message_template(guild.id)
+            messages.append(birthday_template.replace("{member}", f"<@{user_id}>"))
 
         for name, notify_user_ids, calendar_key in conn.execute(
             "SELECT name, notify_user_ids, calendar_key FROM events WHERE guild_id = ? AND month = ? AND day = ? "

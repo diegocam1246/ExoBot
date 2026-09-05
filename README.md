@@ -105,6 +105,19 @@ To bulk-load birthdays instead of setting them one by one, attach a JSON file to
 ```
 `user_id` is the member's numeric Discord ID (right-click a member -> Copy User ID; requires Developer Mode on in Discord settings). Re-importing updates existing entries rather than duplicating them. `/exportbirthdays` and `/exportevents` give you the reverse (CSV downloads) if you want to check what's currently saved.
 
+Same idea for events — attach a JSON file to `/importevents`, a list of `{"name": ..., "month": ..., "day": ..., "year": optional, "notify": optional}` objects:
+```json
+[
+  {"name": "Team standup", "month": 9, "day": 10},
+  {"name": "Anniversary", "month": 9, "day": 10, "year": 2027}
+]
+```
+`year` defaults to the current year if omitted (same as `/addevent`). Each
+imported event is created exactly like running `/addevent` would (including
+`notify`), just without the calendar link/announcement — it's a straight
+data load. Unlike birthdays, re-importing doesn't merge with existing
+entries — running it twice creates duplicates, so only import once per file.
+
 **Who gets @mentioned in the day-of reminder:** whatever you passed as
 `notify` to `/addevent` — individual `@members` and/or `@roles`, whatever
 you typed (Discord turns it into real mention markup before the bot sees

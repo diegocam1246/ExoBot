@@ -788,6 +788,61 @@ async def exportevents(interaction: discord.Interaction):
     await interaction.response.send_message(file=file, ephemeral=True)
 
 
+@bot.tree.command(description="Bulk-import events from a JSON file (Administrator only)")
+@app_commands.describe(
+    file='A JSON file: a list of {"name": ..., "month": 1-12, "day": 1-31, "year": optional, "notify": optional}'
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def importevents(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data = json.loads((await file.read()).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        await interaction.followup.send(f"Couldn't parse that file as JSON: {e}", ephemeral=True)
+        return
+
+    if not isinstance(data, list):
+        await interaction.followup.send(
+            'Expected a JSON array of {"name", "month", "day"} objects.', ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    imported = 0
+    errors = []
+    for i, entry in enumerate(data):
+        try:
+            name = str(entry["name"])
+            month = int(entry["month"])
+            day = int(entry["day"])
+            year = int(entry["year"]) if entry.get("year") else datetime.date.today().year
+            datetime.date(year, month, day)  # validate
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"Entry {i}: invalid or missing name/month/day/year")
+            continue
+        notify_tokens = extract_mention_tokens(entry.get("notify"))
+        conn.execute(
+            "INSERT INTO events (guild_id, name, month, day, year, created_by, notify_user_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                interaction.guild_id, name, month, day, year, interaction.user.id,
+                " ".join(notify_tokens) or None,
+            ),
+        )
+        imported += 1
+    conn.commit()
+    conn.close()
+
+    summary = f"Imported {imported} event(s)."
+    if errors:
+        shown = errors[:10]
+        summary += "\n" + "\n".join(shown)
+        if len(errors) > 10:
+            summary += f"\n...and {len(errors) - 10} more errors."
+    await interaction.followup.send(summary, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # Background task: check daily and post reminders
 # ---------------------------------------------------------------------------

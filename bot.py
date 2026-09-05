@@ -314,10 +314,10 @@ def parse_event_time(time: str | None) -> tuple[int, int]:
     return hour, minute
 
 
-def event_datetime_bounds(month: int, day: int, year: int, time: str | None):
+def event_datetime_bounds(month: int, day: int, year: int, time: str | None, duration: int | None = None):
     """Returns (is_all_day, start, end). For an all-day event, start/end are
-    dates; for a timed one (time given), they're UTC datetimes one hour
-    apart, computed from TIMEZONE."""
+    dates; for a timed one (time given), they're UTC datetimes `duration`
+    minutes apart (default 60), computed from TIMEZONE."""
     event_date = datetime.date(year, month, day)
     if not time:
         return True, event_date, event_date + datetime.timedelta(days=1)
@@ -325,11 +325,12 @@ def event_datetime_bounds(month: int, day: int, year: int, time: str | None):
     start = datetime.datetime(
         year, month, day, hour, minute, tzinfo=ZoneInfo(TIMEZONE)
     ).astimezone(datetime.timezone.utc)
-    return False, start, start + datetime.timedelta(hours=1)
+    return False, start, start + datetime.timedelta(minutes=duration or 60)
 
 
 def calendar_add_link(
-    name: str, month: int, day: int, year: int, time: str | None = None, location: str | None = None
+    name: str, month: int, day: int, year: int, time: str | None = None,
+    duration: int | None = None, location: str | None = None,
 ) -> str:
     """Builds a generic Google Calendar 'quick add' URL for a single-date
     event. Clicking it lets ANY user (no login/API needed on our end) add
@@ -337,7 +338,7 @@ def calendar_add_link(
     create-event form — nothing here is tied to a specific organization
     calendar, since the bot's service account only has view access and
     can't create events itself."""
-    is_all_day, start, end = event_datetime_bounds(month, day, year, time)
+    is_all_day, start, end = event_datetime_bounds(month, day, year, time, duration)
     params = {"action": "TEMPLATE", "text": name}
     if is_all_day:
         params["dates"] = f"{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
@@ -349,12 +350,13 @@ def calendar_add_link(
 
 
 def build_ics_file(
-    name: str, month: int, day: int, year: int, time: str | None = None, location: str | None = None
+    name: str, month: int, day: int, year: int, time: str | None = None,
+    duration: int | None = None, location: str | None = None,
 ) -> discord.File:
     """Builds a universal .ics calendar file for a single-date event (works
     with Google, Outlook, Apple Calendar, etc.) that anyone can download and
     import directly."""
-    is_all_day, start, end = event_datetime_bounds(month, day, year, time)
+    is_all_day, start, end = event_datetime_bounds(month, day, year, time, duration)
     uid = f"{start.isoformat()}-{abs(hash(name))}@birthday-bot"
 
     lines = [
@@ -624,6 +626,7 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     day="1-31",
     year="Leave empty to use the current year",
     time="Optional start time, 24h format HH:MM (defaults to an all-day event)",
+    duration="Duration in minutes, only used with time (defaults to 60)",
     location="Optional location",
     notify="@mention the members/roles this event concerns (tagged in the announcement)",
 )
@@ -635,6 +638,7 @@ async def addevent(
     day: app_commands.Range[int, 1, 31],
     year: int = None,
     time: str = None,
+    duration: int = None,
     location: str = None,
     notify: str = None,
 ):
@@ -655,11 +659,17 @@ async def addevent(
             )
             return
 
-    link = calendar_add_link(name, month, day, year, time=time, location=location)
+    if duration is not None and duration < 1:
+        await interaction.response.send_message(
+            "Duration must be a positive number of minutes.", ephemeral=True
+        )
+        return
+
+    link = calendar_add_link(name, month, day, year, time=time, duration=duration, location=location)
 
     await interaction.response.send_message(
         f"New event added! If you wish to add it to your calendar, click on this link: {link}",
-        file=build_ics_file(name, month, day, year, time=time, location=location),
+        file=build_ics_file(name, month, day, year, time=time, duration=duration, location=location),
     )
 
     # Remember who this concerns so that when the synced-from-calendar copy of

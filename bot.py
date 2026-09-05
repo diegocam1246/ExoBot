@@ -26,7 +26,9 @@ Setup:
 
 import os
 import io
+import csv
 import json
+import re
 import sqlite3
 import datetime
 from urllib.parse import urlencode
@@ -49,7 +51,20 @@ REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "9"))  # 24h local time to post r
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "reminders.db"))
 
 # Google Calendar (optional — if not configured, calendar features are skipped)
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+# Maps a friendly team name to its Google Calendar ID, e.g.:
+# {"Chefs": "abc@group.calendar.google.com", "Énergie": "..."}
+try:
+    GOOGLE_CALENDARS = json.loads(os.getenv("GOOGLE_CALENDARS") or "{}")
+except json.JSONDecodeError:
+    print("GOOGLE_CALENDARS is not valid JSON — calendar features disabled.")
+    GOOGLE_CALENDARS = {}
+
+# Choices shown in the /addevent calendar dropdown; falls back to a single
+# placeholder if no calendars are configured, since Discord requires at
+# least one choice.
+CALENDAR_CHOICES = [
+    app_commands.Choice(name=k, value=k) for k in GOOGLE_CALENDARS.keys()
+] or [app_commands.Choice(name="(no calendars configured)", value="")]
 # Either point to a local key file (fine for a VPS/Pi)...
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_FILE",
@@ -99,6 +114,10 @@ def get_db():
         conn.execute("ALTER TABLE events ADD COLUMN calendar_event_id TEXT")
     if "calendar_link" not in existing_cols:
         conn.execute("ALTER TABLE events ADD COLUMN calendar_link TEXT")
+    if "notify_user_ids" not in existing_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN notify_user_ids TEXT")
+    if "calendar_key" not in existing_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN calendar_key TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS settings (
             guild_id INTEGER PRIMARY KEY,
@@ -147,7 +166,7 @@ def get_calendar_service():
         return _calendar_service
     _calendar_checked = True
 
-    if not GOOGLE_CALENDAR_ID:
+    if not GOOGLE_CALENDARS:
         print("Google Calendar not configured — skipping calendar event creation.")
         return None
 
@@ -183,13 +202,14 @@ def resolve_event_date(month: int, day: int, year: int | None) -> datetime.date:
     return event_date
 
 
-def create_calendar_event(name: str, month: int, day: int, year: int | None):
-    """Creates a matching all-day event on the shared Google Calendar.
+def create_calendar_event(calendar_id: str | None, name: str, month: int, day: int, year: int | None):
+    """Creates a matching all-day event on the given team calendar.
     One-off events (year given) are a single day; yearly events (year=None)
     get an annual RRULE recurrence. Returns (event_id, html_link) or
-    (None, None) if calendar integration isn't set up or the call fails."""
+    (None, None) if calendar integration isn't set up, no calendar was
+    picked, or the call fails."""
     service = get_calendar_service()
-    if service is None:
+    if service is None or not calendar_id:
         return None, None
 
     event_date = resolve_event_date(month, day, year)
@@ -203,23 +223,103 @@ def create_calendar_event(name: str, month: int, day: int, year: int | None):
         body["recurrence"] = ["RRULE:FREQ=YEARLY"]
 
     try:
-        created = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
+        created = service.events().insert(calendarId=calendar_id, body=body).execute()
         return created.get("id"), created.get("htmlLink")
     except HttpError as e:
         print(f"Google Calendar API error creating event: {e}")
         return None, None
 
 
-def delete_calendar_event(calendar_event_id: str | None):
-    if not calendar_event_id:
+def delete_calendar_event(calendar_id: str | None, calendar_event_id: str | None):
+    if not calendar_id or not calendar_event_id:
         return
     service = get_calendar_service()
     if service is None:
         return
     try:
-        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=calendar_event_id).execute()
+        service.events().delete(calendarId=calendar_id, eventId=calendar_event_id).execute()
     except HttpError as e:
         print(f"Google Calendar API error deleting event: {e}")
+
+
+def parse_mentions(text: str | None) -> list[int]:
+    """Extracts user IDs from typed @mentions (e.g. '@Alice @Bob')."""
+    if not text:
+        return []
+    return [int(uid) for uid in re.findall(r"<@!?(\d+)>", text)]
+
+
+def build_csv_file(filename: str, header: list[str], rows: list[list]) -> discord.File:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return discord.File(io.BytesIO(buf.getvalue().encode("utf-8")), filename=filename)
+
+
+def fetch_calendar_series() -> tuple[dict, set]:
+    """Lists upcoming events across all configured team calendars and
+    collapses each recurring series down to a single entry (keyed by
+    (calendar_key, series id)), using the next occurrence found in the
+    window as that series' reference date. This snapshot is used both to
+    pick up events created directly on a calendar's website, and — by
+    noticing what's now absent from it — to prune ones deleted the same way.
+
+    Also returns the set of calendar_keys whose listing failed this round,
+    so callers can skip treating "absent" as "deleted" for those — a
+    transient API error must never be mistaken for everything on that
+    calendar having been removed."""
+    service = get_calendar_service()
+    if service is None:
+        return {}, set()
+
+    now = datetime.datetime.utcnow()
+    time_min = (now - datetime.timedelta(days=1)).isoformat() + "Z"
+    time_max = (now + datetime.timedelta(days=400)).isoformat() + "Z"
+
+    series = {}
+    failed_calendars = set()
+    for calendar_key, calendar_id in GOOGLE_CALENDARS.items():
+        page_token = None
+        try:
+            while True:
+                resp = service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    pageToken=page_token,
+                ).execute()
+                for ev in resp.get("items", []):
+                    if ev.get("status") == "cancelled":
+                        continue
+                    series_id = ev.get("recurringEventId") or ev["id"]
+                    key = (calendar_key, series_id)
+                    if key in series:
+                        continue  # already recorded this series' next occurrence
+                    start = ev["start"].get("date") or ev["start"].get("dateTime")
+                    if not start:
+                        continue
+                    d = datetime.date.fromisoformat(start[:10])
+                    is_recurring = "recurringEventId" in ev
+                    series[key] = {
+                        "name": ev.get("summary") or "Untitled event",
+                        "month": d.month,
+                        "day": d.day,
+                        "year": None if is_recurring else d.year,
+                        "calendar_key": calendar_key,
+                        "calendar_event_id": series_id,
+                        "calendar_link": ev.get("htmlLink"),
+                    }
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+        except HttpError as e:
+            print(f"Google Calendar API error listing events on '{calendar_key}': {e}")
+            failed_calendars.add(calendar_key)
+
+    return series, failed_calendars
 
 
 def personal_add_link(name: str, month: int, day: int, year: int | None) -> str:
@@ -265,13 +365,6 @@ def build_ics_file(name: str, month: int, day: int, year: int | None) -> discord
     return discord.File(io.BytesIO(ics_bytes), filename=f"{safe_name}.ics")
 
 
-def can_manage_others(interaction: discord.Interaction) -> bool:
-    """True if the invoking user is allowed to edit/remove OTHER people's
-    birthdays. Server mods (Manage Server permission) or the server owner."""
-    perms = interaction.user.guild_permissions
-    return perms.manage_guild or interaction.user == interaction.guild.owner
-
-
 # ---------------------------------------------------------------------------
 # Startup: set the bot's display name (nickname) in each server it's in
 # ---------------------------------------------------------------------------
@@ -296,6 +389,8 @@ async def on_ready():
 
     if not daily_check.is_running():
         daily_check.start()
+    if not sync_calendar_events.is_running():
+        sync_calendar_events.start()
 
 
 @bot.event
@@ -310,7 +405,7 @@ async def on_guild_join(guild: discord.Guild):
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "You need the **Manage Server** permission to do that.", ephemeral=True
+            "You need **Administrator** permission to do that.", ephemeral=True
         )
         return
     # Fall back to logging anything unexpected instead of failing silently
@@ -325,7 +420,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Slash commands: setup
 # ---------------------------------------------------------------------------
 @bot.tree.command(description="Set the channel where birthday/event reminders are posted")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     conn = get_db()
     conn.execute(
@@ -341,7 +436,7 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
 
 
 @bot.tree.command(description="Set a custom announcement template for new events (use {name} and {when})")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def seteventmessage(interaction: discord.Interaction, template: str):
     conn = get_db()
     conn.execute(
@@ -359,8 +454,9 @@ async def seteventmessage(interaction: discord.Interaction, template: str):
 # ---------------------------------------------------------------------------
 # Slash commands: birthdays
 # ---------------------------------------------------------------------------
-@bot.tree.command(description="Set your (or someone else's) birthday")
+@bot.tree.command(description="Set a member's birthday (Administrator only)")
 @app_commands.describe(month="1-12", day="1-31", member="Leave empty to set your own")
+@app_commands.checks.has_permissions(administrator=True)
 async def setbirthday(
     interaction: discord.Interaction,
     month: app_commands.Range[int, 1, 12],
@@ -368,13 +464,6 @@ async def setbirthday(
     member: discord.Member = None,
 ):
     target = member or interaction.user
-
-    if target != interaction.user and not can_manage_others(interaction):
-        await interaction.response.send_message(
-            "You can only set your own birthday. Ask a mod (Manage Server permission) to set it for someone else.",
-            ephemeral=True,
-        )
-        return
 
     try:
         datetime.date(2024, month, day)  # validate, 2024 = leap year so Feb 29 works
@@ -395,16 +484,10 @@ async def setbirthday(
     )
 
 
-@bot.tree.command(description="Remove a saved birthday")
+@bot.tree.command(description="Remove a saved birthday (Administrator only)")
+@app_commands.checks.has_permissions(administrator=True)
 async def removebirthday(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
-
-    if target != interaction.user and not can_manage_others(interaction):
-        await interaction.response.send_message(
-            "You can only remove your own birthday. Ask a mod (Manage Server permission) to remove it for someone else.",
-            ephemeral=True,
-        )
-        return
 
     conn = get_db()
     conn.execute(
@@ -455,6 +538,82 @@ async def birthdays(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines))
 
 
+@bot.tree.command(description="Export all saved birthdays as a CSV file (Administrator only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def exportbirthdays(interaction: discord.Interaction):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT user_id, month, day FROM birthdays WHERE guild_id = ? ORDER BY month, day",
+        (interaction.guild_id,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("No birthdays saved yet.", ephemeral=True)
+        return
+
+    csv_rows = []
+    for user_id, month, day in rows:
+        member = interaction.guild.get_member(user_id)
+        name = member.display_name if member else "(left server)"
+        csv_rows.append([name, user_id, month, day])
+
+    file = build_csv_file(
+        "birthdays.csv", ["Member", "User ID", "Month", "Day"], csv_rows
+    )
+    await interaction.response.send_message(file=file, ephemeral=True)
+
+
+@bot.tree.command(description="Bulk-import birthdays from a JSON file (Administrator only)")
+@app_commands.describe(
+    file='A JSON file: a list of {"user_id": 123456789012345678, "month": 1-12, "day": 1-31}'
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def importbirthdays(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data = json.loads((await file.read()).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        await interaction.followup.send(f"Couldn't parse that file as JSON: {e}", ephemeral=True)
+        return
+
+    if not isinstance(data, list):
+        await interaction.followup.send(
+            'Expected a JSON array of {"user_id", "month", "day"} objects.', ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    imported = 0
+    errors = []
+    for i, entry in enumerate(data):
+        try:
+            user_id = int(entry["user_id"])
+            month = int(entry["month"])
+            day = int(entry["day"])
+            datetime.date(2024, month, day)  # validate, 2024 = leap year so Feb 29 works
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"Entry {i}: invalid or missing user_id/month/day")
+            continue
+        conn.execute(
+            "INSERT INTO birthdays (guild_id, user_id, month, day) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET month=excluded.month, day=excluded.day",
+            (interaction.guild_id, user_id, month, day),
+        )
+        imported += 1
+    conn.commit()
+    conn.close()
+
+    summary = f"Imported {imported} birthday(s)."
+    if errors:
+        shown = errors[:10]
+        summary += "\n" + "\n".join(shown)
+        if len(errors) > 10:
+            summary += f"\n...and {len(errors) - 10} more errors."
+    await interaction.followup.send(summary, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # Slash commands: events
 # ---------------------------------------------------------------------------
@@ -463,17 +622,22 @@ async def birthdays(interaction: discord.Interaction):
     name="What the event is",
     month="1-12",
     day="1-31",
+    calendar="Which team calendar to add this event to",
     year="Leave empty for a yearly-repeating event",
     announcement="Optional one-off message for this event (overrides the server template)",
+    notify="@mention the specific members this event concerns (they'll be tagged now and on the day)",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.choices(calendar=CALENDAR_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
 async def addevent(
     interaction: discord.Interaction,
     name: str,
     month: app_commands.Range[int, 1, 12],
     day: app_commands.Range[int, 1, 31],
+    calendar: app_commands.Choice[str],
     year: int = None,
     announcement: str = None,
+    notify: str = None,
 ):
     try:
         datetime.date(year or 2024, month, day)
@@ -481,25 +645,37 @@ async def addevent(
         await interaction.response.send_message("That's not a real date.", ephemeral=True)
         return
 
+    calendar_key = calendar.value or None
+    calendar_id = GOOGLE_CALENDARS.get(calendar_key) if calendar_key else None
+    notify_ids = parse_mentions(notify)
+
     await interaction.response.defer()  # calendar API call can take a moment
 
-    calendar_event_id, calendar_link = create_calendar_event(name, month, day, year)
+    calendar_event_id, calendar_link = create_calendar_event(calendar_id, name, month, day, year)
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, calendar_link) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (interaction.guild_id, name, month, day, year, interaction.user.id, calendar_event_id, calendar_link),
+        "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, calendar_link, notify_user_ids, calendar_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            interaction.guild_id, name, month, day, year, interaction.user.id,
+            calendar_event_id, calendar_link,
+            ",".join(str(uid) for uid in notify_ids) or None,
+            calendar_key,
+        ),
     )
     conn.commit()
 
     when = f"{month:02d}/{day:02d}" + (f"/{year}" if year else " (yearly)")
     add_link = personal_add_link(name, month, day, year)
+    mentions = " ".join(f"<@{uid}>" for uid in notify_ids)
 
-    confirmation = f"Added event **{name}** on {when}."
+    confirmation = f"Added event **{name}** on {when}" + (f" to **{calendar_key}**." if calendar_key else ".")
     if calendar_link:
         confirmation += f"\n📅 [View on server calendar]({calendar_link})"
     confirmation += f"\n➕ [Add to your own calendar]({add_link})"
+    if mentions:
+        confirmation += f"\n🔔 Notifying: {mentions}"
     await interaction.followup.send(confirmation, file=build_ics_file(name, month, day, year))
 
     # Post the announcement to the configured reminder channel, if one is set
@@ -513,21 +689,59 @@ async def addevent(
             else:
                 text = f"📢 New event added: **{name}** — {when}"
             text += f"\n➕ [Add to your own calendar]({add_link})"
+            if mentions:
+                text += f"\n🔔 {mentions}"
             await channel.send(text, file=build_ics_file(name, month, day, year))
 
     conn.close()
 
 
+@bot.tree.command(description="Set which members get @mentioned for an existing event, replacing any previous list (see /events for IDs)")
+@app_commands.describe(
+    event_id="The event's ID (see /events)",
+    notify="@mention the members this event concerns",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def notifyevent(interaction: discord.Interaction, event_id: int, notify: str):
+    notify_ids = parse_mentions(notify)
+    if not notify_ids:
+        await interaction.response.send_message(
+            "Couldn't find any @mentions in that — make sure to actually @-mention the members.",
+            ephemeral=True,
+        )
+        return
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM events WHERE id = ? AND guild_id = ?", (event_id, interaction.guild_id)
+    ).fetchone()
+    if not row:
+        conn.close()
+        await interaction.response.send_message(f"No event with ID #{event_id}.", ephemeral=True)
+        return
+
+    conn.execute(
+        "UPDATE events SET notify_user_ids = ? WHERE id = ? AND guild_id = ?",
+        (",".join(str(uid) for uid in notify_ids), event_id, interaction.guild_id),
+    )
+    conn.commit()
+    conn.close()
+
+    mentions = " ".join(f"<@{uid}>" for uid in notify_ids)
+    await interaction.response.send_message(f"Event #{event_id} will now notify: {mentions}")
+
+
 @bot.tree.command(description="Remove an event by its listed ID (see /events)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def removeevent(interaction: discord.Interaction, event_id: int):
     conn = get_db()
     row = conn.execute(
-        "SELECT calendar_event_id FROM events WHERE id = ? AND guild_id = ?",
+        "SELECT calendar_event_id, calendar_key FROM events WHERE id = ? AND guild_id = ?",
         (event_id, interaction.guild_id),
     ).fetchone()
     if row and row[0]:
-        delete_calendar_event(row[0])
+        calendar_event_id, calendar_key = row
+        delete_calendar_event(GOOGLE_CALENDARS.get(calendar_key), calendar_event_id)
     conn.execute(
         "DELETE FROM events WHERE id = ? AND guild_id = ?", (event_id, interaction.guild_id)
     )
@@ -540,7 +754,7 @@ async def removeevent(interaction: discord.Interaction, event_id: int):
 async def events(interaction: discord.Interaction):
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name, month, day, year, calendar_link FROM events WHERE guild_id = ?",
+        "SELECT id, name, month, day, year, calendar_link, calendar_key FROM events WHERE guild_id = ?",
         (interaction.guild_id,),
     ).fetchall()
     conn.close()
@@ -551,7 +765,7 @@ async def events(interaction: discord.Interaction):
 
     today = datetime.date.today()
     entries = []
-    for event_id, name, month, day, year, calendar_link in rows:
+    for event_id, name, month, day, year, calendar_link, calendar_key in rows:
         if year:
             try:
                 d = datetime.date(year, month, day)
@@ -563,16 +777,60 @@ async def events(interaction: discord.Interaction):
             d = datetime.date(today.year, month, day)
             if d < today:
                 d = datetime.date(today.year + 1, month, day)
-        entries.append((d, event_id, name, calendar_link))
+        entries.append((d, event_id, name, calendar_link, calendar_key))
 
     entries.sort()
     lines = []
-    for d, eid, name, calendar_link in entries:
+    for d, eid, name, calendar_link, calendar_key in entries:
         line = f"`#{eid}` **{name}** — {d.strftime('%Y-%m-%d')} (in {(d - today).days} days)"
+        if calendar_key:
+            line += f" · {calendar_key}"
         if calendar_link:
             line += f" · [Server cal]({calendar_link})"
         lines.append(line)
     await interaction.response.send_message("\n".join(lines) if lines else "No upcoming events.")
+
+
+@bot.tree.command(description="Export all saved events as a CSV file (Administrator only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def exportevents(interaction: discord.Interaction):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, month, day, year, created_by, calendar_link, notify_user_ids, calendar_key FROM events "
+        "WHERE guild_id = ? ORDER BY id",
+        (interaction.guild_id,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("No events saved yet.", ephemeral=True)
+        return
+
+    csv_rows = []
+    for event_id, name, month, day, year, created_by, calendar_link, notify_user_ids, calendar_key in rows:
+        if created_by is None:
+            creator_name = "(added on Google Calendar)"
+        else:
+            creator = interaction.guild.get_member(created_by)
+            creator_name = creator.display_name if creator else "(left server)"
+        notify_names = []
+        for uid in (notify_user_ids or "").split(","):
+            if not uid:
+                continue
+            member = interaction.guild.get_member(int(uid))
+            notify_names.append(member.display_name if member else uid)
+        csv_rows.append(
+            [event_id, name, month, day, year or "", calendar_key or "", creator_name, created_by,
+             calendar_link or "", ", ".join(notify_names)]
+        )
+
+    file = build_csv_file(
+        "events.csv",
+        ["ID", "Name", "Month", "Day", "Year", "Calendar", "Created By", "Created By User ID",
+         "Calendar Link", "Notify"],
+        csv_rows,
+    )
+    await interaction.response.send_message(file=file, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +866,16 @@ async def daily_check():
         ):
             messages.append(f"🎂 Happy Birthday <@{user_id}>! 🎉")
 
-        for name, in conn.execute(
-            "SELECT name FROM events WHERE guild_id = ? AND month = ? AND day = ? "
+        for name, notify_user_ids in conn.execute(
+            "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
             "AND (year = ? OR year IS NULL)",
             (guild.id, today.month, today.day, today.year),
         ):
-            messages.append(f"📅 Reminder: **{name}** is today!")
+            line = f"📅 Reminder: **{name}** is today!"
+            if notify_user_ids:
+                mentions = " ".join(f"<@{uid}>" for uid in notify_user_ids.split(","))
+                line += f" {mentions}"
+            messages.append(line)
 
         if messages:
             await channel.send("\n".join(messages))
@@ -623,6 +885,57 @@ async def daily_check():
 
 @daily_check.before_loop
 async def before_daily_check():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Background task: import events created directly on the shared Google
+# Calendar (rather than via /addevent) so they get reminded too
+# ---------------------------------------------------------------------------
+@tasks.loop(hours=6)
+async def sync_calendar_events():
+    if not GOOGLE_CALENDARS:
+        return  # calendar integration not configured
+
+    series, failed_calendars = fetch_calendar_series()
+
+    conn = get_db()
+    for guild in bot.guilds:
+        tracked = conn.execute(
+            "SELECT id, calendar_key, calendar_event_id FROM events WHERE guild_id = ? AND calendar_event_id IS NOT NULL",
+            (guild.id,),
+        ).fetchall()
+        existing_ids = {(calendar_key, calendar_event_id) for _, calendar_key, calendar_event_id in tracked}
+
+        for (calendar_key, calendar_event_id), info in series.items():
+            if (calendar_key, calendar_event_id) in existing_ids:
+                continue
+            conn.execute(
+                "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, calendar_link, calendar_key) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (
+                    guild.id, info["name"], info["month"], info["day"], info["year"],
+                    calendar_event_id, info["calendar_link"], calendar_key,
+                ),
+            )
+
+        # Prune events no longer on their calendar (deleted directly on the
+        # website). Only trust absence for a calendar we actually queried
+        # successfully this round — skip calendars that errored, that were
+        # renamed/removed from GOOGLE_CALENDARS since, and legacy rows from
+        # before per-calendar tracking existed (calendar_key is NULL) — none
+        # of those can be verified, so "absent" doesn't mean "deleted."
+        for row_id, calendar_key, calendar_event_id in tracked:
+            if not calendar_key or calendar_key not in GOOGLE_CALENDARS or calendar_key in failed_calendars:
+                continue
+            if (calendar_key, calendar_event_id) not in series:
+                conn.execute("DELETE FROM events WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+
+
+@sync_calendar_events.before_loop
+async def before_sync_calendar_events():
     await bot.wait_until_ready()
 
 

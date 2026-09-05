@@ -47,13 +47,24 @@ permission to run)
 /setbirthday month:3 day:2 member:@someone
 /birthdays
 
-/addevent name:"Team standup" month:9 day:10
-/addevent name:"Anniversary" month:9 day:10 year:2027   (one-off, won't repeat)
+/addevent name:"Team standup" month:9 day:10 calendar:Chefs
+/addevent name:"Anniversary" month:9 day:10 year:2027 calendar:Général   (one-off, won't repeat)
 /events
 ```
 
+To bulk-load birthdays instead of setting them one by one, attach a JSON file to `/importbirthdays` — a list of `{"user_id": ..., "month": ..., "day": ...}` objects:
+```json
+[
+  {"user_id": 123456789012345678, "month": 6, "day": 15},
+  {"user_id": 234567890123456789, "month": 3, "day": 2}
+]
+```
+`user_id` is the member's numeric Discord ID (right-click a member -> Copy User ID; requires Developer Mode on in Discord settings). Re-importing updates existing entries rather than duplicating them. `/exportbirthdays` gives you the reverse (a CSV, not JSON) if you want to check what's currently saved.
+
+`calendar` is a required dropdown — pick which team calendar the event belongs to (see setup below for how these are configured).
+
 When `/addevent` runs, it:
-1. Creates a matching event on the shared server Google Calendar, if configured
+1. Creates a matching event on the chosen team's Google Calendar, if configured
    (yearly events get an annual recurrence rule automatically).
 2. Generates a personal **"Add to your own calendar"** link (a Google Calendar
    quick-add URL — works instantly for anyone, no setup needed) plus a
@@ -76,9 +87,21 @@ for a single event:
 /addevent name:"Surprise party" month:10 day:5 announcement:"🎉 Shhh, don't tell them"
 ```
 
+To notify specific members (rather than the whole channel) about an event, type their `@mentions` into `notify` — they'll get tagged both in the creation announcement and again in the reminder on the day:
+```
+/addevent name:"Client demo" month:9 day:20 calendar:Général notify:"@Alice @Bob"
+```
+
+You can set or change who gets notified for an *existing* event too (its ID comes from `/events`) — useful for events imported from a calendar, which don't have anyone tagged by default:
+```
+/notifyevent event_id:12 notify:"@Alice @Bob"
+```
+This replaces the event's notify list entirely (not additive) — always type everyone who should be tagged.
+
 ## 6. Set up Google Calendar integration (optional)
-This uses a **service account** (a robot Google account), not your personal
-login, so the bot can create events without you re-authenticating.
+This uses a single **service account** (a robot Google account), not your
+personal login, so the bot can create events without you re-authenticating —
+and it's shared across all your team calendars, so you only set it up once.
 
 1. Go to https://console.cloud.google.com/ and create a project (or reuse one).
 2. **APIs & Services -> Library** -> search "Google Calendar API" -> Enable.
@@ -90,17 +113,41 @@ login, so the bot can create events without you re-authenticating.
    `GOOGLE_SERVICE_ACCOUNT_FILE` at wherever you put it).
 5. Note the service account's email address (looks like
    `something@your-project.iam.gserviceaccount.com`).
-6. Open Google Calendar (the calendar you want events created on) ->
-   **Settings and sharing** -> **Share with specific people** -> add the
-   service account email with **"Make changes to events"** permission.
-7. Still in that calendar's settings, scroll to **Integrate calendar** and
-   copy the **Calendar ID** (your own calendar's ID is just your Gmail
-   address; a dedicated calendar has an ID like
-   `abc123@group.calendar.google.com`).
-8. Set `GOOGLE_CALENDAR_ID` in `.env` to that ID.
+6. For **each** team calendar (Chefs, Embarqué, Général, Mécanique, Énergie,
+   Birthdays, ...): open it in Google Calendar -> **Settings and sharing** ->
+   **Share with specific people** -> add the service account email with
+   **"Make changes to events"** permission.
+7. Still in each calendar's settings, scroll to **Integrate calendar** and
+   copy its **Calendar ID** (looks like `abc123@group.calendar.google.com`).
+8. Set `GOOGLE_CALENDARS` in `.env` to a JSON object mapping each team's
+   display name (exactly what you want to show up in the `/addevent`
+   dropdown) to its Calendar ID:
+   ```
+   GOOGLE_CALENDARS={"Chefs":"abc1@group.calendar.google.com","Embarqué":"abc2@group.calendar.google.com","Général":"abc3@group.calendar.google.com","Mécanique":"abc4@group.calendar.google.com","Énergie":"abc5@group.calendar.google.com","Birthdays":"abc6@group.calendar.google.com"}
+   ```
+   On Railway, paste this as the value of a single `GOOGLE_CALENDARS`
+   variable (Variables tab accepts the raw JSON string directly).
 
-If `GOOGLE_CALENDAR_ID` or the service account file isn't set, calendar
-features are silently skipped — everything else keeps working.
+If `GOOGLE_CALENDARS` or the service account file isn't set, calendar
+features are silently skipped — everything else keeps working. Adding a new
+team later is just adding one more entry to that JSON object, no code changes
+needed.
+
+Events don't have to come from `/addevent` — every 6 hours the bot also
+checks every configured calendar for anything added directly on its website
+and imports it, so it gets Discord reminders too, tagged with whichever
+calendar it came from. Recurring events are collapsed into a single
+yearly-repeating entry; one-off events import with their actual date.
+(Attendee tagging via `notify` only applies to events added through
+`/addevent`, since the calendar has no concept of Discord members.)
+
+The same sync also catches deletions: if an event (bot-created or
+calendar-created) is removed directly on a calendar's website instead of via
+`/removeevent`, it disappears from that calendar's listing on the next sync
+and gets dropped from the bot's database too, so it stops being reminded. A
+calendar whose listing fails to load that round (e.g. a transient API error)
+is skipped for deletion purposes, so an outage can't be mistaken for
+everything on it having been deleted.
 
 ## 7. How reminders work
 Every day at `REMINDER_HOUR` (your local time, per `TIMEZONE`), the bot checks
@@ -120,7 +167,7 @@ the database and posts to the configured channel:
    "web" service, go to Settings and remove any exposed port / health check).
 3. **Set environment variables** — Settings -> Variables -> add each one from
    your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`,
-   `REMINDER_HOUR`, and if using Calendar: `GOOGLE_CALENDAR_ID` +
+   `REMINDER_HOUR`, and if using Calendar: `GOOGLE_CALENDARS` +
    `GOOGLE_SERVICE_ACCOUNT_JSON` (paste the **entire contents** of your
    `service_account.json` key file as the value — this is what lets you use
    Calendar integration without ever committing that file).

@@ -4,11 +4,19 @@ Birthday & Event Reminder Bot
 Features:
 - Sets a custom bot name (nickname) per server on startup
 - /setbirthday, /removebirthday, /birthdays   -> manage birthdays
-- /addevent, /removeevent, /events            -> manage one-off/annual events
-- /addevent auto-creates a linked Google Calendar event and posts an
-  announcement to the reminder channel (customizable via /seteventmessage)
-- /setchannel                                 -> pick where reminders/announcements post
-- /seteventmessage                            -> set the default new-event announcement text
+- /addevent, /events                          -> manage one-off/annual events
+- /addevent posts an announcement (tagging whichever members/roles you pass
+  via `notify`) to the configured channel with a generic Google Calendar
+  link + .ics file — it's not written to any calendar automatically, since
+  the bot's Google service account only has view access; whoever manages the
+  org's calendars picks the right one manually when they open the link
+- Separately, a periodic sync picks up whatever's actually on each configured
+  calendar and imports it for day-of Discord reminders (independent of
+  /addevent's one-time announcement above)
+- /notifyevent, /addmentionall, /removementionall -> control who gets
+  @mentioned in a day-of reminder for a synced event; defaults to a role
+  matching the calendar's name
+- /setchannel                                 -> pick where announcements/reminders post
 - Daily background task checks the DB and posts birthday/event reminders
 
 Setup:
@@ -59,12 +67,6 @@ except json.JSONDecodeError:
     print("GOOGLE_CALENDARS is not valid JSON — calendar features disabled.")
     GOOGLE_CALENDARS = {}
 
-# Choices shown in the /addevent calendar dropdown; falls back to a single
-# placeholder if no calendars are configured, since Discord requires at
-# least one choice.
-CALENDAR_CHOICES = [
-    app_commands.Choice(name=k, value=k) for k in GOOGLE_CALENDARS.keys()
-] or [app_commands.Choice(name="(no calendars configured)", value="")]
 # Either point to a local key file (fine for a VPS/Pi)...
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_FILE",
@@ -128,6 +130,17 @@ def get_db():
     existing_settings_cols = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
     if "event_announcement" not in existing_settings_cols:
         conn.execute("ALTER TABLE settings ADD COLUMN event_announcement TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pending_event_notifies (
+            guild_id INTEGER,
+            name TEXT,
+            month INTEGER,
+            day INTEGER,
+            year INTEGER,
+            notify TEXT,
+            created_at TEXT
+        )"""
+    )
     return conn
 
 
@@ -138,15 +151,6 @@ def get_reminder_channel(guild_id: int):
     ).fetchone()
     conn.close()
     return row[0] if row else None
-
-
-def get_announcement_template(guild_id: int):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT event_announcement FROM settings WHERE guild_id = ?", (guild_id,)
-    ).fetchone()
-    conn.close()
-    return row[0] if row and row[0] else None
 
 
 # ---------------------------------------------------------------------------
@@ -190,63 +194,42 @@ def get_calendar_service():
     return _calendar_service
 
 
-def resolve_event_date(month: int, day: int, year: int | None) -> datetime.date:
-    """The concrete calendar date to use for a one-off or next occurrence of
-    a yearly event, given today's date."""
-    today = datetime.date.today()
-    if year:
-        return datetime.date(year, month, day)
-    event_date = datetime.date(today.year, month, day)
-    if event_date < today:
-        event_date = datetime.date(today.year + 1, month, day)
-    return event_date
+def find_calendar_role(guild: discord.Guild, calendar_key: str | None):
+    """Finds the Discord role whose name matches a team calendar's name
+    (case-insensitive), used as the default mention for an event when no
+    explicit /notifyevent override has been set for it."""
+    if not calendar_key:
+        return None
+    return discord.utils.find(lambda r: r.name.lower() == calendar_key.lower(), guild.roles)
 
 
-def create_calendar_event(calendar_id: str | None, name: str, month: int, day: int, year: int | None):
-    """Creates a matching all-day event on the given team calendar.
-    One-off events (year given) are a single day; yearly events (year=None)
-    get an annual RRULE recurrence. Returns (event_id, html_link) or
-    (None, None) if calendar integration isn't set up, no calendar was
-    picked, or the call fails."""
-    service = get_calendar_service()
-    if service is None or not calendar_id:
-        return None, None
-
-    event_date = resolve_event_date(month, day, year)
-
-    body = {
-        "summary": name,
-        "start": {"date": event_date.isoformat()},
-        "end": {"date": (event_date + datetime.timedelta(days=1)).isoformat()},
-    }
-    if not year:
-        body["recurrence"] = ["RRULE:FREQ=YEARLY"]
-
-    try:
-        created = service.events().insert(calendarId=calendar_id, body=body).execute()
-        return created.get("id"), created.get("htmlLink")
-    except HttpError as e:
-        print(f"Google Calendar API error creating event: {e}")
-        return None, None
-
-
-def delete_calendar_event(calendar_id: str | None, calendar_event_id: str | None):
-    if not calendar_id or not calendar_event_id:
-        return
-    service = get_calendar_service()
-    if service is None:
-        return
-    try:
-        service.events().delete(calendarId=calendar_id, eventId=calendar_event_id).execute()
-    except HttpError as e:
-        print(f"Google Calendar API error deleting event: {e}")
-
-
-def parse_mentions(text: str | None) -> list[int]:
-    """Extracts user IDs from typed @mentions (e.g. '@Alice @Bob')."""
+def extract_mention_tokens(text: str | None) -> list[str]:
+    """Extracts @member and @role mention tokens as-is (e.g. '<@123>',
+    '<@&456>') from typed text, normalizing the nickname-mention form
+    '<@!123>' down to '<@123>'. Preserves the distinction between a member
+    and a role mention, unlike extracting bare IDs, so the same stored value
+    can be re-emitted directly as a working mention later."""
     if not text:
         return []
-    return [int(uid) for uid in re.findall(r"<@!?(\d+)>", text)]
+    tokens = []
+    for tok in re.findall(r"<@&?\d+>|<@!\d+>", text):
+        if tok.startswith("<@!"):
+            tok = "<@" + tok[3:]
+        tokens.append(tok)
+    return tokens
+
+
+def describe_mention_token(guild: discord.Guild, token: str) -> str:
+    """Human-readable label for a stored mention token, for CSV export."""
+    m = re.match(r"<@&(\d+)>", token)
+    if m:
+        role = guild.get_role(int(m.group(1)))
+        return f"@{role.name}" if role else token
+    m = re.match(r"<@(\d+)>", token)
+    if m:
+        member = guild.get_member(int(m.group(1)))
+        return f"@{member.display_name}" if member else token
+    return token
 
 
 def build_csv_file(filename: str, header: list[str], rows: list[list]) -> discord.File:
@@ -322,28 +305,57 @@ def fetch_calendar_series() -> tuple[dict, set]:
     return series, failed_calendars
 
 
-def personal_add_link(name: str, month: int, day: int, year: int | None) -> str:
-    """Builds a Google Calendar 'quick add' URL. Clicking it lets ANY user
-    (no login/API needed on our end) add the event to their own personal
-    Google Calendar — separate from the shared calendar the bot manages."""
-    event_date = resolve_event_date(month, day, year)
-    end_date = event_date + datetime.timedelta(days=1)
-    params = {
-        "action": "TEMPLATE",
-        "text": name,
-        "dates": f"{event_date.strftime('%Y%m%d')}/{end_date.strftime('%Y%m%d')}",
-    }
-    if not year:
-        params["recur"] = "RRULE:FREQ=YEARLY"
+def parse_event_time(time: str | None) -> tuple[int, int]:
+    """Parses a 24h 'HH:MM' string. Raises ValueError if malformed."""
+    hour_str, minute_str = time.split(":")
+    hour, minute = int(hour_str), int(minute_str)
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        raise ValueError("hour/minute out of range")
+    return hour, minute
+
+
+def event_datetime_bounds(month: int, day: int, year: int, time: str | None):
+    """Returns (is_all_day, start, end). For an all-day event, start/end are
+    dates; for a timed one (time given), they're UTC datetimes one hour
+    apart, computed from TIMEZONE."""
+    event_date = datetime.date(year, month, day)
+    if not time:
+        return True, event_date, event_date + datetime.timedelta(days=1)
+    hour, minute = parse_event_time(time)
+    start = datetime.datetime(
+        year, month, day, hour, minute, tzinfo=ZoneInfo(TIMEZONE)
+    ).astimezone(datetime.timezone.utc)
+    return False, start, start + datetime.timedelta(hours=1)
+
+
+def calendar_add_link(
+    name: str, month: int, day: int, year: int, time: str | None = None, location: str | None = None
+) -> str:
+    """Builds a generic Google Calendar 'quick add' URL for a single-date
+    event. Clicking it lets ANY user (no login/API needed on our end) add
+    the event to whichever of their own calendars they choose in the
+    create-event form — nothing here is tied to a specific organization
+    calendar, since the bot's service account only has view access and
+    can't create events itself."""
+    is_all_day, start, end = event_datetime_bounds(month, day, year, time)
+    params = {"action": "TEMPLATE", "text": name}
+    if is_all_day:
+        params["dates"] = f"{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
+    else:
+        params["dates"] = f"{start.strftime('%Y%m%dT%H%M%SZ')}/{end.strftime('%Y%m%dT%H%M%SZ')}"
+    if location:
+        params["location"] = location
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
 
-def build_ics_file(name: str, month: int, day: int, year: int | None) -> discord.File:
-    """Builds a universal .ics calendar file (works with Google, Outlook,
-    Apple Calendar, etc.) that anyone can download and import directly."""
-    event_date = resolve_event_date(month, day, year)
-    end_date = event_date + datetime.timedelta(days=1)
-    uid = f"{event_date.isoformat()}-{abs(hash(name))}@birthday-bot"
+def build_ics_file(
+    name: str, month: int, day: int, year: int, time: str | None = None, location: str | None = None
+) -> discord.File:
+    """Builds a universal .ics calendar file for a single-date event (works
+    with Google, Outlook, Apple Calendar, etc.) that anyone can download and
+    import directly."""
+    is_all_day, start, end = event_datetime_bounds(month, day, year, time)
+    uid = f"{start.isoformat()}-{abs(hash(name))}@birthday-bot"
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -352,12 +364,16 @@ def build_ics_file(name: str, month: int, day: int, year: int | None) -> discord
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
-        f"DTSTART;VALUE=DATE:{event_date.strftime('%Y%m%d')}",
-        f"DTEND;VALUE=DATE:{end_date.strftime('%Y%m%d')}",
-        f"SUMMARY:{name}",
     ]
-    if not year:
-        lines.append("RRULE:FREQ=YEARLY")
+    if is_all_day:
+        lines.append(f"DTSTART;VALUE=DATE:{start.strftime('%Y%m%d')}")
+        lines.append(f"DTEND;VALUE=DATE:{end.strftime('%Y%m%d')}")
+    else:
+        lines.append(f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}")
+        lines.append(f"DTEND:{end.strftime('%Y%m%dT%H%M%SZ')}")
+    lines.append(f"SUMMARY:{name}")
+    if location:
+        lines.append(f"LOCATION:{location}")
     lines += ["END:VEVENT", "END:VCALENDAR"]
     ics_bytes = ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
@@ -432,22 +448,6 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
     conn.close()
     await interaction.response.send_message(
         f"Reminders will now be posted in {channel.mention}.", ephemeral=True
-    )
-
-
-@bot.tree.command(description="Set a custom announcement template for new events (use {name} and {when})")
-@app_commands.checks.has_permissions(administrator=True)
-async def seteventmessage(interaction: discord.Interaction, template: str):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO settings (guild_id, event_announcement) VALUES (?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET event_announcement = excluded.event_announcement",
-        (interaction.guild_id, template),
-    )
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(
-        f"New-event announcements will now use:\n> {template}", ephemeral=True
     )
 
 
@@ -617,96 +617,91 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
 # ---------------------------------------------------------------------------
 # Slash commands: events
 # ---------------------------------------------------------------------------
-@bot.tree.command(description="Add a reminder event (e.g. tournament, meeting, launch date)")
+@bot.tree.command(description="Announce a new event and get a link to add it to a calendar")
 @app_commands.describe(
     name="What the event is",
     month="1-12",
     day="1-31",
-    calendar="Which team calendar to add this event to",
-    year="Leave empty for a yearly-repeating event",
-    announcement="Optional one-off message for this event (overrides the server template)",
-    notify="@mention the specific members this event concerns (they'll be tagged now and on the day)",
+    year="Leave empty to use the current year",
+    time="Optional start time, 24h format HH:MM (defaults to an all-day event)",
+    location="Optional location",
+    notify="@mention the members/roles this event concerns (tagged in the announcement)",
 )
-@app_commands.choices(calendar=CALENDAR_CHOICES)
 @app_commands.checks.has_permissions(administrator=True)
 async def addevent(
     interaction: discord.Interaction,
     name: str,
     month: app_commands.Range[int, 1, 12],
     day: app_commands.Range[int, 1, 31],
-    calendar: app_commands.Choice[str],
     year: int = None,
-    announcement: str = None,
+    time: str = None,
+    location: str = None,
     notify: str = None,
 ):
+    year = year or datetime.date.today().year
+
     try:
-        datetime.date(year or 2024, month, day)
+        datetime.date(year, month, day)
     except ValueError:
         await interaction.response.send_message("That's not a real date.", ephemeral=True)
         return
 
-    calendar_key = calendar.value or None
-    calendar_id = GOOGLE_CALENDARS.get(calendar_key) if calendar_key else None
-    notify_ids = parse_mentions(notify)
+    if time is not None:
+        try:
+            parse_event_time(time)
+        except ValueError:
+            await interaction.response.send_message(
+                "Time must be in 24h HH:MM format, e.g. 14:30.", ephemeral=True
+            )
+            return
 
-    await interaction.response.defer()  # calendar API call can take a moment
+    link = calendar_add_link(name, month, day, year, time=time, location=location)
 
-    calendar_event_id, calendar_link = create_calendar_event(calendar_id, name, month, day, year)
-
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, calendar_link, notify_user_ids, calendar_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            interaction.guild_id, name, month, day, year, interaction.user.id,
-            calendar_event_id, calendar_link,
-            ",".join(str(uid) for uid in notify_ids) or None,
-            calendar_key,
-        ),
+    await interaction.response.send_message(
+        f"New event added! If you wish to add it to your calendar, click on this link: {link}",
+        file=build_ics_file(name, month, day, year, time=time, location=location),
     )
-    conn.commit()
 
-    when = f"{month:02d}/{day:02d}" + (f"/{year}" if year else " (yearly)")
-    add_link = personal_add_link(name, month, day, year)
-    mentions = " ".join(f"<@{uid}>" for uid in notify_ids)
+    # Remember who this concerns so that when the synced-from-calendar copy of
+    # this event later shows up (matched by name + date), it inherits the
+    # same day-of reminder mentions instead of falling back to the calendar's
+    # default role. See sync_calendar_events.
+    notify_tokens = extract_mention_tokens(notify)
+    if notify_tokens:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO pending_event_notifies (guild_id, name, month, day, year, notify, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                interaction.guild_id, name, month, day, year,
+                " ".join(notify_tokens), datetime.datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
 
-    confirmation = f"Added event **{name}** on {when}" + (f" to **{calendar_key}**." if calendar_key else ".")
-    if calendar_link:
-        confirmation += f"\n📅 [View on server calendar]({calendar_link})"
-    confirmation += f"\n➕ [Add to your own calendar]({add_link})"
-    if mentions:
-        confirmation += f"\n🔔 Notifying: {mentions}"
-    await interaction.followup.send(confirmation, file=build_ics_file(name, month, day, year))
-
-    # Post the announcement to the configured reminder channel, if one is set
     channel_id = get_reminder_channel(interaction.guild_id)
     if channel_id:
         channel = interaction.guild.get_channel(channel_id)
         if channel:
-            template = announcement or get_announcement_template(interaction.guild_id)
-            if template:
-                text = template.replace("{name}", name).replace("{when}", when)
-            else:
-                text = f"📢 New event added: **{name}** — {when}"
-            text += f"\n➕ [Add to your own calendar]({add_link})"
-            if mentions:
-                text += f"\n🔔 {mentions}"
-            await channel.send(text, file=build_ics_file(name, month, day, year))
-
-    conn.close()
+            text = f"📢 New event: **{name}**"
+            if notify:
+                text += f" {notify}"
+            text += f"\n➕ [Add to your calendar]({link})"
+            await channel.send(text, file=build_ics_file(name, month, day, year, time=time, location=location))
 
 
-@bot.tree.command(description="Set which members get @mentioned for an existing event, replacing any previous list (see /events for IDs)")
+@bot.tree.command(description="Set who gets @mentioned for an existing event (replaces the list)")
 @app_commands.describe(
     event_id="The event's ID (see /events)",
-    notify="@mention the members this event concerns",
+    notify="@mention the members/roles this event concerns",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def notifyevent(interaction: discord.Interaction, event_id: int, notify: str):
-    notify_ids = parse_mentions(notify)
-    if not notify_ids:
+    tokens = extract_mention_tokens(notify)
+    if not tokens:
         await interaction.response.send_message(
-            "Couldn't find any @mentions in that — make sure to actually @-mention the members.",
+            "Couldn't find any @mentions in that — make sure to actually @-mention the members/roles.",
             ephemeral=True,
         )
         return
@@ -722,32 +717,80 @@ async def notifyevent(interaction: discord.Interaction, event_id: int, notify: s
 
     conn.execute(
         "UPDATE events SET notify_user_ids = ? WHERE id = ? AND guild_id = ?",
-        (",".join(str(uid) for uid in notify_ids), event_id, interaction.guild_id),
+        (" ".join(tokens), event_id, interaction.guild_id),
     )
     conn.commit()
     conn.close()
 
-    mentions = " ".join(f"<@{uid}>" for uid in notify_ids)
-    await interaction.response.send_message(f"Event #{event_id} will now notify: {mentions}")
+    await interaction.response.send_message(f"Event #{event_id} will now notify: {' '.join(tokens)}")
 
 
-@bot.tree.command(description="Remove an event by its listed ID (see /events)")
+@bot.tree.command(description="Add a member/role to every tracked event's notify list (Administrator only)")
+@app_commands.describe(notify="@mention the member(s)/role(s) to add to every event")
 @app_commands.checks.has_permissions(administrator=True)
-async def removeevent(interaction: discord.Interaction, event_id: int):
+async def addmentionall(interaction: discord.Interaction, notify: str):
+    add_tokens = set(extract_mention_tokens(notify))
+    if not add_tokens:
+        await interaction.response.send_message(
+            "Couldn't find any @mentions in that.", ephemeral=True
+        )
+        return
+
     conn = get_db()
-    row = conn.execute(
-        "SELECT calendar_event_id, calendar_key FROM events WHERE id = ? AND guild_id = ?",
-        (event_id, interaction.guild_id),
-    ).fetchone()
-    if row and row[0]:
-        calendar_event_id, calendar_key = row
-        delete_calendar_event(GOOGLE_CALENDARS.get(calendar_key), calendar_event_id)
-    conn.execute(
-        "DELETE FROM events WHERE id = ? AND guild_id = ?", (event_id, interaction.guild_id)
-    )
+    rows = conn.execute(
+        "SELECT id, notify_user_ids FROM events WHERE guild_id = ?", (interaction.guild_id,)
+    ).fetchall()
+    for event_id, notify_user_ids in rows:
+        existing = set(extract_mention_tokens(notify_user_ids))
+        updated = existing | add_tokens
+        conn.execute(
+            "UPDATE events SET notify_user_ids = ? WHERE id = ?",
+            (" ".join(updated), event_id),
+        )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"Removed event #{event_id}.")
+
+    mentions = " ".join(add_tokens)
+    await interaction.response.send_message(
+        f"Added {mentions} to {len(rows)} event(s). Note: any event that was relying on its "
+        "calendar's default role mention now has an explicit list instead, which no longer "
+        "includes that role unless you add it too."
+    )
+
+
+@bot.tree.command(description="Remove a member/role from every tracked event's notify list (Admin only)")
+@app_commands.describe(notify="@mention the member(s)/role(s) to remove from every event")
+@app_commands.checks.has_permissions(administrator=True)
+async def removementionall(interaction: discord.Interaction, notify: str):
+    remove_tokens = set(extract_mention_tokens(notify))
+    if not remove_tokens:
+        await interaction.response.send_message(
+            "Couldn't find any @mentions in that.", ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, notify_user_ids FROM events WHERE guild_id = ? AND notify_user_ids IS NOT NULL",
+        (interaction.guild_id,),
+    ).fetchall()
+    changed = 0
+    for event_id, notify_user_ids in rows:
+        existing = set(extract_mention_tokens(notify_user_ids))
+        updated = existing - remove_tokens
+        if updated == existing:
+            continue
+        changed += 1
+        new_value = " ".join(updated) or None
+        conn.execute("UPDATE events SET notify_user_ids = ? WHERE id = ?", (new_value, event_id))
+    conn.commit()
+    conn.close()
+
+    mentions = " ".join(remove_tokens)
+    await interaction.response.send_message(
+        f"Removed {mentions} from {changed} event(s). Any event left with an empty list now "
+        "falls back to its calendar's default role mention again."
+    )
 
 
 @bot.tree.command(description="List all upcoming events")
@@ -813,12 +856,10 @@ async def exportevents(interaction: discord.Interaction):
         else:
             creator = interaction.guild.get_member(created_by)
             creator_name = creator.display_name if creator else "(left server)"
-        notify_names = []
-        for uid in (notify_user_ids or "").split(","):
-            if not uid:
-                continue
-            member = interaction.guild.get_member(int(uid))
-            notify_names.append(member.display_name if member else uid)
+        notify_names = [
+            describe_mention_token(interaction.guild, tok)
+            for tok in extract_mention_tokens(notify_user_ids)
+        ]
         csv_rows.append(
             [event_id, name, month, day, year or "", calendar_key or "", creator_name, created_by,
              calendar_link or "", ", ".join(notify_names)]
@@ -866,15 +907,18 @@ async def daily_check():
         ):
             messages.append(f"🎂 Happy Birthday <@{user_id}>! 🎉")
 
-        for name, notify_user_ids in conn.execute(
-            "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
+        for name, notify_user_ids, calendar_key in conn.execute(
+            "SELECT name, notify_user_ids, calendar_key FROM events WHERE guild_id = ? AND month = ? AND day = ? "
             "AND (year = ? OR year IS NULL)",
             (guild.id, today.month, today.day, today.year),
         ):
             line = f"📅 Reminder: **{name}** is today!"
             if notify_user_ids:
-                mentions = " ".join(f"<@{uid}>" for uid in notify_user_ids.split(","))
-                line += f" {mentions}"
+                line += f" {notify_user_ids}"
+            else:
+                role = find_calendar_role(guild, calendar_key)
+                if role:
+                    line += f" {role.mention}"
             messages.append(line)
 
         if messages:
@@ -900,6 +944,12 @@ async def sync_calendar_events():
     series, failed_calendars = fetch_calendar_series()
 
     conn = get_db()
+
+    # Pending notify requests from /addevent expire after 90 days if the
+    # matching event never actually showed up on a calendar.
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).isoformat()
+    conn.execute("DELETE FROM pending_event_notifies WHERE created_at < ?", (cutoff,))
+
     for guild in bot.guilds:
         tracked = conn.execute(
             "SELECT id, calendar_key, calendar_event_id FROM events WHERE guild_id = ? AND calendar_event_id IS NOT NULL",
@@ -910,12 +960,26 @@ async def sync_calendar_events():
         for (calendar_key, calendar_event_id), info in series.items():
             if (calendar_key, calendar_event_id) in existing_ids:
                 continue
+
+            # If this matches a pending /addevent notify request (by name +
+            # date), inherit those mentions instead of the calendar's default
+            # role, and consume the pending request.
+            pending = conn.execute(
+                "SELECT rowid, notify FROM pending_event_notifies "
+                "WHERE guild_id = ? AND name = ? AND month = ? AND day = ? AND year IS ?",
+                (guild.id, info["name"], info["month"], info["day"], info["year"]),
+            ).fetchone()
+            notify_user_ids = None
+            if pending:
+                pending_rowid, notify_user_ids = pending
+                conn.execute("DELETE FROM pending_event_notifies WHERE rowid = ?", (pending_rowid,))
+
             conn.execute(
-                "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, calendar_link, calendar_key) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                "INSERT INTO events (guild_id, name, month, day, year, created_by, calendar_event_id, "
+                "calendar_link, calendar_key, notify_user_ids) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                 (
                     guild.id, info["name"], info["month"], info["day"], info["year"],
-                    calendar_event_id, info["calendar_link"], calendar_key,
+                    calendar_event_id, info["calendar_link"], calendar_key, notify_user_ids,
                 ),
             )
 

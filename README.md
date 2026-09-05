@@ -47,10 +47,24 @@ permission to run)
 /setbirthday month:3 day:2 member:@someone
 /birthdays
 
-/addevent name:"Team standup" month:9 day:10 calendar:Chefs
-/addevent name:"Anniversary" month:9 day:10 year:2027 calendar:Général   (one-off, won't repeat)
+/addevent name:"Team standup" month:9 day:10 notify:"@Chefs"        (uses the current year)
+/addevent name:"Anniversary" month:9 day:10 year:2027
+/addevent name:"Kickoff meeting" month:9 day:20 time:14:30 location:"Room A-201" notify:"@Alice @Bob"
 /events
 ```
+
+`/addevent` always creates a single-date event (no repeating/annual option)
+— `year` is optional and just defaults to the current year if you leave it
+out, it doesn't mean "repeat every year." If something genuinely repeats
+every year, set that up as an actual recurring event directly on the
+calendar (see Calendar setup below) instead of through this command.
+
+Typical setup: run `/setchannel` pointing at a **public** announcement channel,
+then run `/addevent` from a separate **private/admin-only** channel (that
+restriction is just normal Discord channel permissions, nothing to configure
+in the bot) — the command's reply goes to wherever you ran it, but the actual
+announcement always posts to the channel from `/setchannel`, regardless of
+where the command was run.
 
 To bulk-load birthdays instead of setting them one by one, attach a JSON file to `/importbirthdays` — a list of `{"user_id": ..., "month": ..., "day": ...}` objects:
 ```json
@@ -61,47 +75,66 @@ To bulk-load birthdays instead of setting them one by one, attach a JSON file to
 ```
 `user_id` is the member's numeric Discord ID (right-click a member -> Copy User ID; requires Developer Mode on in Discord settings). Re-importing updates existing entries rather than duplicating them. `/exportbirthdays` gives you the reverse (a CSV, not JSON) if you want to check what's currently saved.
 
-`calendar` is a required dropdown — pick which team calendar the event belongs to (see setup below for how these are configured).
+**Important:** the bot's Google service account only has *view* access to your
+calendars (see setup below for why), so `/addevent` cannot create the event
+on any calendar itself — it's purely an announcement + link generator:
+1. Posts an announcement to the channel set via `/setchannel`, tagging
+   whatever you passed in `notify` (individual `@members` and/or `@roles` —
+   whatever you typed, since Discord already turns it into real mention
+   markup before the bot sees it) alongside a generic **Google Calendar
+   quick-add link**.
+2. That link opens the normal "Create event" panel pre-filled with the
+   name/date/time, with the destination **Calendar** dropdown left for the
+   person opening it to choose. Anyone can use it to add the event to their
+   own personal calendar; whoever manages your org's shared calendars can
+   open the same link and pick the right team calendar (e.g.
+   "Exocet - Chefs") from that dropdown before saving.
+3. Attaches a universal `.ics` file (works with Google, Outlook, Apple
+   Calendar, etc.) as an alternative to the link, in both the announcement
+   and the command's own reply.
 
-When `/addevent` runs, it:
-1. Creates a matching event on the chosen team's Google Calendar, if configured
-   (yearly events get an annual recurrence rule automatically).
-2. Generates a personal **"Add to your own calendar"** link (a Google Calendar
-   quick-add URL — works instantly for anyone, no setup needed) plus a
-   universal `.ics` file attachment that works with Google, Outlook, Apple
-   Calendar, or anything else.
-3. Posts an announcement to the reminder channel with both of those.
+`time` (24h `HH:MM`) and `location` are both optional — omit `time` for an
+all-day event.
 
-The personal add-link and `.ics` file work even if you never set up the
-Google Calendar integration below — that part only affects the shared
-server-wide calendar.
+**`notify` carries forward to the day-of reminder too.** If you pass
+`notify` to `/addevent`, whoever manages the calendars later saves this same
+event (same name, month, day and year) onto one of the team calendars, and
+the periodic sync picks it up (every 6 hours — see Calendar setup below),
+that synced copy automatically inherits the exact same mention list for its
+day-of reminder. You don't need to set it again. This match is done purely
+by name + date, so keep the name identical when actually creating it on the
+calendar.
 
-The announcement text defaults to `📢 New event added: **<name>** — <when>`.
-You can customize it per-server:
-```
-/seteventmessage template:"🚨 Heads up! **{name}** is happening {when}"
-```
-`{name}` and `{when}` get filled in automatically. You can also override it
-for a single event:
-```
-/addevent name:"Surprise party" month:10 day:5 announcement:"🎉 Shhh, don't tell them"
-```
-
-To notify specific members (rather than the whole channel) about an event, type their `@mentions` into `notify` — they'll get tagged both in the creation announcement and again in the reminder on the day:
-```
-/addevent name:"Client demo" month:9 day:20 calendar:Général notify:"@Alice @Bob"
-```
-
-You can set or change who gets notified for an *existing* event too (its ID comes from `/events`) — useful for events imported from a calendar, which don't have anyone tagged by default:
+If an event was instead created **directly on a calendar** (never went
+through `/addevent`, so there's no notify to inherit), the day-of reminder
+defaults to tagging whichever Discord **role** has the same name as its
+calendar (e.g. an event on the "Chefs" calendar pings your `@Chefs` role —
+make sure that role actually exists in your server). Either way, you can
+always override who gets tagged for one specific event (its ID comes from
+`/events`, available only after the sync has picked the event up):
 ```
 /notifyevent event_id:12 notify:"@Alice @Bob"
 ```
-This replaces the event's notify list entirely (not additive) — always type everyone who should be tagged.
+This replaces that event's mention list entirely (not additive), and takes
+priority over both the inherited `/addevent` notify and the calendar-role
+default. To bulk-edit across every tracked event at once instead:
+```
+/addmentionall notify:"@Alice"        (adds Alice to every event's list)
+/removementionall notify:"@Alice"     (removes her from every event's list)
+```
+Careful with `/addmentionall`: any event that was relying on its calendar's
+role default now gets an explicit list instead, which won't include that
+role unless you add it too. Removing the last person from an event's list
+via `/removementionall` reverts it back to the calendar-role default.
 
 ## 6. Set up Google Calendar integration (optional)
 This uses a single **service account** (a robot Google account), not your
-personal login, so the bot can create events without you re-authenticating —
-and it's shared across all your team calendars, so you only set it up once.
+personal login, shared across all your team calendars so you only set it up
+once. **The service account only needs (and in practice, for a Workspace
+domain with restricted external sharing, may only be *allowed*) view access**
+— it reads each calendar periodically to know what's there; it never writes
+to Google Calendar itself. Actually creating/editing events on the shared
+calendars is a manual, human step (see `/addevent` above).
 
 1. Go to https://console.cloud.google.com/ and create a project (or reuse one).
 2. **APIs & Services -> Library** -> search "Google Calendar API" -> Enable.
@@ -115,13 +148,19 @@ and it's shared across all your team calendars, so you only set it up once.
    `something@your-project.iam.gserviceaccount.com`).
 6. For **each** team calendar (Chefs, Embarqué, Général, Mécanique, Énergie,
    Birthdays, ...): open it in Google Calendar -> **Settings and sharing** ->
-   **Share with specific people** -> add the service account email with
-   **"Make changes to events"** permission.
+   **Share with specific people** -> add the service account email. Pick the
+   highest permission your organization's sharing policy allows you to grant
+   to an external account — **"Make changes to events"** if allowed, but
+   **"See all event details"** works fine too, since the bot only reads.
+   (If your Workspace domain restricts external sharing to view-only, that's
+   expected and not a problem here — it's exactly why the read-only design
+   above exists.)
 7. Still in each calendar's settings, scroll to **Integrate calendar** and
-   copy its **Calendar ID** (looks like `abc123@group.calendar.google.com`).
+   copy its **Calendar ID** (looks like `abc123@group.calendar.google.com`) —
+   not the "Public URL" or embed code further down that same section.
 8. Set `GOOGLE_CALENDARS` in `.env` to a JSON object mapping each team's
-   display name (exactly what you want to show up in the `/addevent`
-   dropdown) to its Calendar ID:
+   display name (matching a Discord role of the same name, used for default
+   reminder mentions — see below) to its Calendar ID:
    ```
    GOOGLE_CALENDARS={"Chefs":"abc1@group.calendar.google.com","Embarqué":"abc2@group.calendar.google.com","Général":"abc3@group.calendar.google.com","Mécanique":"abc4@group.calendar.google.com","Énergie":"abc5@group.calendar.google.com","Birthdays":"abc6@group.calendar.google.com"}
    ```
@@ -130,24 +169,24 @@ and it's shared across all your team calendars, so you only set it up once.
 
 If `GOOGLE_CALENDARS` or the service account file isn't set, calendar
 features are silently skipped — everything else keeps working. Adding a new
-team later is just adding one more entry to that JSON object, no code changes
-needed.
+team later is just adding one more entry to that JSON object (and creating a
+matching Discord role for default mentions), no code changes needed.
 
-Events don't have to come from `/addevent` — every 6 hours the bot also
-checks every configured calendar for anything added directly on its website
-and imports it, so it gets Discord reminders too, tagged with whichever
-calendar it came from. Recurring events are collapsed into a single
-yearly-repeating entry; one-off events import with their actual date.
-(Attendee tagging via `notify` only applies to events added through
-`/addevent`, since the calendar has no concept of Discord members.)
+Every 6 hours the bot checks every configured calendar for whatever's
+currently on it and imports anything new into its own database, so it starts
+getting Discord reminders — this is the **only** way an event ends up in the
+bot's reminder system (see `/addevent` above). Recurring events are
+collapsed into a single yearly-repeating entry; one-off events import with
+their actual date.
 
-The same sync also catches deletions: if an event (bot-created or
-calendar-created) is removed directly on a calendar's website instead of via
-`/removeevent`, it disappears from that calendar's listing on the next sync
-and gets dropped from the bot's database too, so it stops being reminded. A
-calendar whose listing fails to load that round (e.g. a transient API error)
-is skipped for deletion purposes, so an outage can't be mistaken for
-everything on it having been deleted.
+The same sync also catches deletions: if an event is removed directly on a
+calendar's website, it disappears from that calendar's listing on the next
+sync and gets dropped from the bot's database too, so it stops being
+reminded — this is the only way to remove a tracked event, there's no
+Discord-side delete command since the bot can't write to the calendar
+anyway. A calendar whose listing fails to load that round (e.g. a transient
+API error) is skipped for deletion purposes that round, so an outage can't
+be mistaken for everything on it having been deleted.
 
 ## 7. How reminders work
 Every day at `REMINDER_HOUR` (your local time, per `TIMEZONE`), the bot checks

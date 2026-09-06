@@ -82,7 +82,7 @@ def get_db():
             name TEXT,
             month INTEGER,
             day INTEGER,
-            year INTEGER,       -- NULL for events that repeat every year
+            year INTEGER,
             created_by INTEGER,
             calendar_event_id TEXT,
             calendar_link TEXT
@@ -286,6 +286,62 @@ def event_datetime_bounds(month: int, day: int, year: int, time: str | None, dur
         year, month, day, hour, minute, tzinfo=ZoneInfo(TIMEZONE)
     ).astimezone(datetime.timezone.utc)
     return False, start, start + datetime.timedelta(minutes=duration or 60)
+
+
+DISCORD_EVENT_DEFAULT_START_HOUR = 9
+DISCORD_EVENT_DEFAULT_DURATION_MINUTES = 8 * 60  # 9am-5pm
+
+
+def discord_event_bounds(
+    month: int, day: int, year: int, time: str | None, duration: int | None = None
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """Returns (start, end) as UTC datetimes for a Discord Scheduled Event,
+    which always requires concrete times even for an all-day event. With no
+    `time` given, defaults the start to 9am (local TIMEZONE) rather than
+    spanning the full day, since that reads more naturally in Discord's
+    event UI — `duration` still applies on top of that default start."""
+    if time:
+        _, start, end = event_datetime_bounds(month, day, year, time, duration)
+        return start, end
+    start = datetime.datetime(
+        year, month, day, DISCORD_EVENT_DEFAULT_START_HOUR, 0, tzinfo=ZoneInfo(TIMEZONE)
+    ).astimezone(datetime.timezone.utc)
+    end = start + datetime.timedelta(minutes=duration or DISCORD_EVENT_DEFAULT_DURATION_MINUTES)
+    return start, end
+
+
+async def create_discord_scheduled_event(
+    guild: discord.Guild, name: str, month: int, day: int, year: int,
+    time: str | None, duration: int | None, location: str | None,
+) -> tuple[int | None, str | None]:
+    """Creates a native Discord Scheduled Event for this event. Returns
+    (event_id, None) on success, or (None, error message) on failure — e.g.
+    missing 'Manage Events' permission — without raising, since this should
+    never block the rest of /addevent from completing."""
+    start, end = discord_event_bounds(month, day, year, time, duration)
+    try:
+        scheduled_event = await guild.create_scheduled_event(
+            name=name,
+            start_time=start,
+            end_time=end,
+            entity_type=discord.EntityType.external,
+            location=location or "Not specified",
+        )
+        return scheduled_event.id, None
+    except discord.HTTPException as e:
+        return None, str(e)
+
+
+async def delete_discord_scheduled_event(guild: discord.Guild, discord_event_id: int | None):
+    """Best-effort delete — silently gives up if it's already gone or the
+    bot lacks permission, since local removal should proceed regardless."""
+    if not discord_event_id:
+        return
+    try:
+        scheduled_event = await guild.fetch_scheduled_event(discord_event_id)
+        await scheduled_event.delete()
+    except discord.HTTPException:
+        pass
 
 
 def calendar_add_link(
@@ -656,15 +712,20 @@ async def addevent(
         )
         return
 
+    await interaction.response.defer()  # creating the Discord event is an API call, may take a moment
+
     notify_tokens = extract_mention_tokens(notify)
+    discord_event_id, discord_event_error = await create_discord_scheduled_event(
+        interaction.guild, name, month, day, year, time, duration, location
+    )
 
     conn = get_db()
     cursor = conn.execute(
-        "INSERT INTO events (guild_id, name, month, day, year, created_by, notify_user_ids) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (guild_id, name, month, day, year, created_by, notify_user_ids, discord_event_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             interaction.guild_id, name, month, day, year, interaction.user.id,
-            " ".join(notify_tokens) or None,
+            " ".join(notify_tokens) or None, discord_event_id,
         ),
     )
     event_id = cursor.lastrowid
@@ -673,8 +734,13 @@ async def addevent(
 
     link = calendar_add_link(name, month, day, year, time=time, duration=duration, location=location)
 
-    await interaction.response.send_message(
-        f"New event added (#{event_id})! If you wish to add it to your calendar, click on this link: {link}",
+    reply = f"New event added (#{event_id})! If you wish to add it to your calendar, click on this link: {link}"
+    if discord_event_id:
+        reply += "\n📌 Also created as a Discord Scheduled Event (see your server's Events tab)."
+    else:
+        reply += f"\n⚠️ Couldn't create a Discord Scheduled Event: {discord_event_error}"
+    await interaction.followup.send(
+        reply,
         file=build_ics_file(name, month, day, year, time=time, duration=duration, location=location),
     )
 
@@ -830,13 +896,23 @@ async def seteventreminder(interaction: discord.Interaction, template: str = Non
 @bot.tree.command(description="Remove an event by its listed ID (see /events)")
 @app_commands.checks.has_permissions(administrator=True)
 async def removeevent(interaction: discord.Interaction, event_id: int):
+    await interaction.response.defer()  # deleting the Discord event is an API call, may take a moment
+
     conn = get_db()
+    row = conn.execute(
+        "SELECT discord_event_id FROM events WHERE id = ? AND guild_id = ?",
+        (event_id, interaction.guild_id),
+    ).fetchone()
     conn.execute(
         "DELETE FROM events WHERE id = ? AND guild_id = ?", (event_id, interaction.guild_id)
     )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"Removed event #{event_id}.")
+
+    if row and row[0]:
+        await delete_discord_scheduled_event(interaction.guild, row[0])
+
+    await interaction.followup.send(f"Removed event #{event_id}.")
 
 
 @bot.tree.command(description="List all upcoming events")
@@ -855,17 +931,12 @@ async def events(interaction: discord.Interaction):
     today = datetime.date.today()
     entries = []
     for event_id, name, month, day, year in rows:
-        if year:
-            try:
-                d = datetime.date(year, month, day)
-            except ValueError:
-                continue
-            if d < today:
-                continue  # past one-off event
-        else:
-            d = datetime.date(today.year, month, day)
-            if d < today:
-                d = datetime.date(today.year + 1, month, day)
+        try:
+            d = datetime.date(year, month, day)
+        except ValueError:
+            continue
+        if d < today:
+            continue  # past event
         entries.append((d, event_id, name))
 
     entries.sort()
@@ -900,7 +971,7 @@ async def exportevents(interaction: discord.Interaction):
             for tok in extract_mention_tokens(notify_user_ids)
         ]
         csv_rows.append(
-            [event_id, name, month, day, year or "", creator_name, created_by, ", ".join(notify_names)]
+            [event_id, name, month, day, year, creator_name, created_by, ", ".join(notify_names)]
         )
 
     file = build_csv_file(
@@ -1007,8 +1078,7 @@ async def _send_event_reminders(conn, guild: discord.Guild, today: datetime.date
 
     messages = []
     for name, notify_user_ids in conn.execute(
-        "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
-        "AND (year = ? OR year IS NULL)",
+        "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? AND year = ?",
         (guild.id, target_date.month, target_date.day, target_date.year),
     ):
         mention = notify_user_ids or ""

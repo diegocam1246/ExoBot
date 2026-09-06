@@ -94,6 +94,8 @@ def get_db():
         conn.execute("ALTER TABLE events ADD COLUMN notify_user_ids TEXT")
     if "calendar_key" not in existing_cols:
         conn.execute("ALTER TABLE events ADD COLUMN calendar_key TEXT")
+    if "discord_event_id" not in existing_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN discord_event_id INTEGER")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS settings (
             guild_id INTEGER PRIMARY KEY,
@@ -147,13 +149,16 @@ def get_event_reminder_template(guild_id: int) -> str:
 def extract_mention_tokens(text: str | None) -> list[str]:
     """Extracts @member and @role mention tokens as-is (e.g. '<@123>',
     '<@&456>') from typed text, normalizing the nickname-mention form
-    '<@!123>' down to '<@123>'. Preserves the distinction between a member
-    and a role mention, unlike extracting bare IDs, so the same stored value
-    can be re-emitted directly as a working mention later."""
+    '<@!123>' down to '<@123>'. Also preserves the special '@everyone' and
+    '@here' mentions, which stay as literal plain text (no ID to bracket)
+    rather than being converted to '<@...>' markup like member/role
+    mentions are. Preserves the distinction between mention types, unlike
+    extracting bare IDs, so the same stored value can be re-emitted directly
+    as a working mention later."""
     if not text:
         return []
     tokens = []
-    for tok in re.findall(r"<@&?\d+>|<@!\d+>", text):
+    for tok in re.findall(r"<@&?\d+>|<@!\d+>|@everyone|@here", text):
         if tok.startswith("<@!"):
             tok = "<@" + tok[3:]
         tokens.append(tok)

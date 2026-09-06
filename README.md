@@ -23,8 +23,9 @@ cd birthday-bot
 pip install -r requirements.txt
 cp .env.example .env
 # edit .env: paste your token, set BOT_NAME to whatever custom name you want,
-# and set your TIMEZONE (the hour reminders post at is set later, per-server,
-# via /setreminderhour)
+# set your TIMEZONE, and optionally BIRTHDAY_REMINDER_HOUR (defaults to 9 —
+# the fixed hour birthday reminders post at, every server, every day. Event
+# reminder timing is set later, per-server, via /setreminderhour)
 python bot.py
 ```
 
@@ -40,9 +41,12 @@ In any channel, run:
 /setchannel #general
 /setreminderhour hour:9
 ```
-`/setchannel` picks where reminders post; `/setreminderhour` picks what hour
-(24h, per your `TIMEZONE`) they post at — defaults to 9am if you never set
-it. Both are per-server and both need Administrator permission to run.
+`/setchannel` picks where reminders post (needs Administrator permission,
+per-server). `/setreminderhour` picks what hour **event** reminders post at
+(24h, per your `TIMEZONE`) — defaults to 9am if you never set it. **Birthday**
+reminders don't use this command at all — they always post at the fixed
+`BIRTHDAY_REMINDER_HOUR` from your `.env` (same hour for every server), since
+they're always same-day and don't need per-server tuning.
 
 ## 5. Add birthdays and events
 ```
@@ -139,13 +143,17 @@ across every tracked event at once instead:
 ```
 
 ## 6. How reminders work
-Every day at whatever hour you set via `/setreminderhour` (your local time,
-per `TIMEZONE`; defaults to 9am), the bot checks the database and posts to
-the configured channel:
-- `🎂 Happy Birthday @user!` for anyone whose birthday is today (customizable
-  per-server via `/setbirthdaymessage template:"..."`, using `{member}`)
+The bot checks the database every few minutes and posts to the configured
+channel once per day per category — birthdays and events are timed
+independently, and can post at different times of day:
+- `🎂 Happy Birthday @user!` for anyone whose birthday is today, at the fixed
+  `BIRTHDAY_REMINDER_HOUR` (your local time, per `TIMEZONE`; same hour for
+  every server). Message customizable per-server via
+  `/setbirthdaymessage template:"..."`, using `{member}`.
 - `📅 Reminder: <event> is today!` for any matching event, with whoever's
-  concerned tagged after it. Customizable per-server via `/seteventreminder`:
+  concerned tagged after it, at whatever hour that server set via
+  `/setreminderhour` (defaults to 9am). Customizable per-server via
+  `/seteventreminder`:
   ```
   /seteventreminder template:"🚨 Heads up! **{name}** is happening {days} day(s) from now"
   /seteventreminder days:3
@@ -173,7 +181,8 @@ the configured channel:
    won't wait for an HTTP port to open (important: if it's misdetected as a
    "web" service, go to Settings and remove any exposed port / health check).
 3. **Set environment variables** — Settings -> Variables -> add each one from
-   your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`.
+   your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`,
+   `BIRTHDAY_REMINDER_HOUR` (optional, defaults to 9).
 4. **Add a Volume for persistence** (important — without this, `reminders.db`
    is wiped on every redeploy since Railway containers are stateless).
    Project -> **+ New -> Volume**, mount it at e.g. `/data`, then set the env

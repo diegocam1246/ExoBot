@@ -50,6 +50,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_NAME = os.getenv("BOT_NAME", "Reminder Bot")  # the "custom name" you want
 TIMEZONE = os.getenv("TIMEZONE", "America/Toronto")
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "reminders.db"))
+# Birthday reminders always fire on the birthday itself, at this one fixed
+# hour for every guild — unlike event reminders, which are per-guild
+# configurable via /setreminderhour.
+BIRTHDAY_REMINDER_HOUR = int(os.getenv("BIRTHDAY_REMINDER_HOUR", "9"))
 
 INTENTS = discord.Intents.default()
 INTENTS.members = True  # needed to fetch member display names
@@ -115,7 +119,12 @@ def get_db():
     if "reminder_hour" not in existing_settings_cols:
         conn.execute("ALTER TABLE settings ADD COLUMN reminder_hour INTEGER")
     if "last_reminder_date" not in existing_settings_cols:
+        # Tracks the last date event reminders were sent (birthdays use their
+        # own separate last_birthday_reminder_date column below), preventing
+        # re-sending multiple times within the same configured hour.
         conn.execute("ALTER TABLE settings ADD COLUMN last_reminder_date TEXT")
+    if "last_birthday_reminder_date" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN last_birthday_reminder_date TEXT")
     return conn
 
 
@@ -140,7 +149,7 @@ def get_reminder_hour(guild_id: int) -> int:
     return row[0] if row and row[0] is not None else DEFAULT_REMINDER_HOUR
 
 
-def get_last_reminder_date(guild_id: int) -> str | None:
+def get_last_event_reminder_date(guild_id: int) -> str | None:
     conn = get_db()
     row = conn.execute(
         "SELECT last_reminder_date FROM settings WHERE guild_id = ?", (guild_id,)
@@ -149,11 +158,31 @@ def get_last_reminder_date(guild_id: int) -> str | None:
     return row[0] if row else None
 
 
-def set_last_reminder_date(guild_id: int, date_str: str):
+def set_last_event_reminder_date(guild_id: int, date_str: str):
     conn = get_db()
     conn.execute(
         "INSERT INTO settings (guild_id, last_reminder_date) VALUES (?, ?) "
         "ON CONFLICT(guild_id) DO UPDATE SET last_reminder_date = excluded.last_reminder_date",
+        (guild_id, date_str),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_birthday_reminder_date(guild_id: int) -> str | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_birthday_reminder_date FROM settings WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_last_birthday_reminder_date(guild_id: int, date_str: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (guild_id, last_birthday_reminder_date) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET last_birthday_reminder_date = excluded.last_birthday_reminder_date",
         (guild_id, date_str),
     )
     conn.commit()
@@ -382,8 +411,8 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
     )
 
 
-@bot.tree.command(description="Set what hour reminders post at (24h, per TIMEZONE)")
-@app_commands.describe(hour="0-23")
+@bot.tree.command(description="Set what hour EVENT reminders post at (24h, per TIMEZONE)")
+@app_commands.describe(hour="0-23 — birthdays have their own fixed time, set via BIRTHDAY_REMINDER_HOUR")
 @app_commands.checks.has_permissions(administrator=True)
 async def setreminderhour(interaction: discord.Interaction, hour: app_commands.Range[int, 0, 23]):
     conn = get_db()
@@ -395,7 +424,9 @@ async def setreminderhour(interaction: discord.Interaction, hour: app_commands.R
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Reminders will now post at {hour:02d}:00 ({TIMEZONE}).", ephemeral=True
+        f"Event reminders will now post at {hour:02d}:00 ({TIMEZONE}). "
+        "(Birthday reminders use a separate fixed time — see BIRTHDAY_REMINDER_HOUR.)",
+        ephemeral=True,
     )
 
 
@@ -936,10 +967,12 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
 
 
 # ---------------------------------------------------------------------------
-# Background task: check every few minutes, post once per day at whatever
-# hour each guild has configured via /setreminderhour (default 9am)
+# Background task: checks every few minutes, posting once per day per guild.
+# Birthdays always fire at the fixed BIRTHDAY_REMINDER_HOUR; events fire at
+# whatever hour that guild configured via /setreminderhour (default 9am).
+# These can be different times, so they're gated and sent independently.
 # ---------------------------------------------------------------------------
-async def _send_guild_reminders(conn, guild: discord.Guild, today: datetime.date, today_str: str):
+async def _send_birthday_reminders(conn, guild: discord.Guild, today: datetime.date):
     channel_id = get_reminder_channel(guild.id)
     if not channel_id:
         return
@@ -948,19 +981,31 @@ async def _send_guild_reminders(conn, guild: discord.Guild, today: datetime.date
         return
 
     messages = []
-    birthday_template = None
-
+    template = None
     for user_id, in conn.execute(
         "SELECT user_id FROM birthdays WHERE guild_id = ? AND month = ? AND day = ?",
         (guild.id, today.month, today.day),
     ):
-        if birthday_template is None:
-            birthday_template = get_birthday_message_template(guild.id)
-        messages.append(birthday_template.replace("{member}", f"<@{user_id}>"))
+        if template is None:
+            template = get_birthday_message_template(guild.id)
+        messages.append(template.replace("{member}", f"<@{user_id}>"))
+
+    if messages:
+        await channel.send("\n".join(messages))
+
+
+async def _send_event_reminders(conn, guild: discord.Guild, today: datetime.date):
+    channel_id = get_reminder_channel(guild.id)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
 
     event_template, days_before = get_event_reminder_settings(guild.id)
     target_date = today + datetime.timedelta(days=days_before)
 
+    messages = []
     for name, notify_user_ids in conn.execute(
         "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
         "AND (year = ? OR year IS NULL)",
@@ -978,10 +1023,6 @@ async def _send_guild_reminders(conn, guild: discord.Guild, today: datetime.date
 
     if messages:
         await channel.send("\n".join(messages))
-    # Only mark today as done once sending actually succeeded (or there was
-    # nothing to send) — on failure, leave it unmarked so later ticks this
-    # same hour keep retrying instead of silently giving up for the day.
-    set_last_reminder_date(guild.id, today_str)
 
 
 @tasks.loop(minutes=5)
@@ -992,21 +1033,31 @@ async def daily_check():
     conn = get_db()
 
     for guild in bot.guilds:
-        if now_local.hour != get_reminder_hour(guild.id):
-            continue
-        if get_last_reminder_date(guild.id) == today_str:
-            continue  # already sent today's reminders for this guild
+        if now_local.hour == BIRTHDAY_REMINDER_HOUR and get_last_birthday_reminder_date(guild.id) != today_str:
+            try:
+                await _send_birthday_reminders(conn, guild, today)
+            except Exception:
+                # Never let one guild's failure (missing channel permissions,
+                # a deleted channel, etc.) kill the whole task — discord.py
+                # only auto-retries on low-level connection errors, so
+                # anything else here would otherwise silently stop reminders
+                # for every guild until the bot restarts.
+                print(f"Failed to send birthday reminders for guild {guild.id} ({guild.name}):")
+                traceback.print_exc()
+            else:
+                # Only mark today as done once sending actually succeeded (or
+                # there was nothing to send) — on failure, leave it unmarked
+                # so later ticks this same hour keep retrying.
+                set_last_birthday_reminder_date(guild.id, today_str)
 
-        try:
-            await _send_guild_reminders(conn, guild, today, today_str)
-        except Exception:
-            # Never let one guild's failure (missing channel permissions, a
-            # deleted channel, etc.) kill the whole task — discord.py only
-            # auto-retries on low-level connection errors, so anything else
-            # here would otherwise silently stop reminders for every guild
-            # until the bot restarts.
-            print(f"Failed to send reminders for guild {guild.id} ({guild.name}):")
-            traceback.print_exc()
+        if now_local.hour == get_reminder_hour(guild.id) and get_last_event_reminder_date(guild.id) != today_str:
+            try:
+                await _send_event_reminders(conn, guild, today)
+            except Exception:
+                print(f"Failed to send event reminders for guild {guild.id} ({guild.name}):")
+                traceback.print_exc()
+            else:
+                set_last_event_reminder_date(guild.id, today_str)
 
     conn.close()
 

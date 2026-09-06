@@ -35,6 +35,7 @@ import json
 import re
 import sqlite3
 import datetime
+import traceback
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -48,7 +49,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_NAME = os.getenv("BOT_NAME", "Reminder Bot")  # the "custom name" you want
 TIMEZONE = os.getenv("TIMEZONE", "America/Toronto")
-REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "9"))  # 24h local time to post reminders
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "reminders.db"))
 
 INTENTS = discord.Intents.default()
@@ -110,6 +110,12 @@ def get_db():
         conn.execute("ALTER TABLE settings ADD COLUMN birthday_message TEXT")
     if "event_reminder" not in existing_settings_cols:
         conn.execute("ALTER TABLE settings ADD COLUMN event_reminder TEXT")
+    if "event_reminder_days_before" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN event_reminder_days_before INTEGER")
+    if "reminder_hour" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN reminder_hour INTEGER")
+    if "last_reminder_date" not in existing_settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN last_reminder_date TEXT")
     return conn
 
 
@@ -120,6 +126,38 @@ def get_reminder_channel(guild_id: int):
     ).fetchone()
     conn.close()
     return row[0] if row else None
+
+
+DEFAULT_REMINDER_HOUR = 9
+
+
+def get_reminder_hour(guild_id: int) -> int:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT reminder_hour FROM settings WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else DEFAULT_REMINDER_HOUR
+
+
+def get_last_reminder_date(guild_id: int) -> str | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_reminder_date FROM settings WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_last_reminder_date(guild_id: int, date_str: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (guild_id, last_reminder_date) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET last_reminder_date = excluded.last_reminder_date",
+        (guild_id, date_str),
+    )
+    conn.commit()
+    conn.close()
 
 
 DEFAULT_BIRTHDAY_MESSAGE = "🎂 Happy Birthday {member}! 🎉"
@@ -134,16 +172,26 @@ def get_birthday_message_template(guild_id: int) -> str:
     return row[0] if row and row[0] else DEFAULT_BIRTHDAY_MESSAGE
 
 
-DEFAULT_EVENT_REMINDER = "📅 Reminder: **{name}** is today!"
+DEFAULT_EVENT_REMINDER_SAME_DAY = "📅 Reminder: **{name}** is today!"
+DEFAULT_EVENT_REMINDER_ADVANCE = "📅 Reminder: **{name}** is in {days} day(s)!"
 
 
-def get_event_reminder_template(guild_id: int) -> str:
+def get_event_reminder_settings(guild_id: int) -> tuple[str, int]:
+    """Returns (template, days_before). days_before defaults to 0 (same-day,
+    the original behavior) if never configured. template falls back to a
+    same-day or advance-notice default depending on days_before, unless a
+    custom one has been set via /seteventreminder."""
     conn = get_db()
     row = conn.execute(
-        "SELECT event_reminder FROM settings WHERE guild_id = ?", (guild_id,)
+        "SELECT event_reminder, event_reminder_days_before FROM settings WHERE guild_id = ?",
+        (guild_id,),
     ).fetchone()
     conn.close()
-    return row[0] if row and row[0] else DEFAULT_EVENT_REMINDER
+    template, days_before = (row[0], row[1]) if row else (None, None)
+    days_before = days_before or 0
+    if not template:
+        template = DEFAULT_EVENT_REMINDER_SAME_DAY if days_before == 0 else DEFAULT_EVENT_REMINDER_ADVANCE
+    return template, days_before
 
 
 def extract_mention_tokens(text: str | None) -> list[str]:
@@ -331,6 +379,23 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
     conn.close()
     await interaction.response.send_message(
         f"Reminders will now be posted in {channel.mention}.", ephemeral=True
+    )
+
+
+@bot.tree.command(description="Set what hour reminders post at (24h, per TIMEZONE)")
+@app_commands.describe(hour="0-23")
+@app_commands.checks.has_permissions(administrator=True)
+async def setreminderhour(interaction: discord.Interaction, hour: app_commands.Range[int, 0, 23]):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (guild_id, reminder_hour) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET reminder_hour = excluded.reminder_hour",
+        (interaction.guild_id, hour),
+    )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"Reminders will now post at {hour:02d}:00 ({TIMEZONE}).", ephemeral=True
     )
 
 
@@ -693,20 +758,42 @@ async def removementionall(interaction: discord.Interaction, notify: str):
     )
 
 
-@bot.tree.command(description="Set the day-of event reminder message (use {name}, {notify})")
+@bot.tree.command(description="Set the event reminder message and/or advance notice (Admin only)")
+@app_commands.describe(
+    template="Optional: new reminder message (use {name}, {days}, {notify})",
+    days="Optional: how many days before the event to remind (0 = same day, the default)",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def seteventreminder(interaction: discord.Interaction, template: str):
+async def seteventreminder(interaction: discord.Interaction, template: str = None, days: int = None):
+    if template is None and days is None:
+        await interaction.response.send_message(
+            "Provide at least one of template or days.", ephemeral=True
+        )
+        return
+
+    if days is not None and days < 0:
+        await interaction.response.send_message(
+            "Days must be zero or a positive number.", ephemeral=True
+        )
+        return
+
     conn = get_db()
     conn.execute(
-        "INSERT INTO settings (guild_id, event_reminder) VALUES (?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET event_reminder = excluded.event_reminder",
-        (interaction.guild_id, template),
+        "INSERT INTO settings (guild_id, event_reminder, event_reminder_days_before) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET "
+        "event_reminder = COALESCE(excluded.event_reminder, settings.event_reminder), "
+        "event_reminder_days_before = COALESCE(excluded.event_reminder_days_before, settings.event_reminder_days_before)",
+        (interaction.guild_id, template, days),
     )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(
-        f"Event reminders will now use:\n> {template}", ephemeral=True
-    )
+
+    parts = []
+    if template is not None:
+        parts.append(f"message:\n> {template}")
+    if days is not None:
+        parts.append(f"reminding {days} day(s) before the event" if days else "reminding on the same day")
+    await interaction.response.send_message("Updated event reminders — " + "; ".join(parts), ephemeral=True)
 
 
 @bot.tree.command(description="Remove an event by its listed ID (see /events)")
@@ -849,63 +936,77 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
 
 
 # ---------------------------------------------------------------------------
-# Background task: check daily and post reminders
+# Background task: check every few minutes, post once per day at whatever
+# hour each guild has configured via /setreminderhour (default 9am)
 # ---------------------------------------------------------------------------
-def _next_run_time():
-    tz = ZoneInfo(TIMEZONE)
-    now = datetime.datetime.now(tz)
-    target = now.replace(hour=REMINDER_HOUR, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += datetime.timedelta(days=1)
-    return target.time()
+async def _send_guild_reminders(conn, guild: discord.Guild, today: datetime.date, today_str: str):
+    channel_id = get_reminder_channel(guild.id)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+
+    messages = []
+    birthday_template = None
+
+    for user_id, in conn.execute(
+        "SELECT user_id FROM birthdays WHERE guild_id = ? AND month = ? AND day = ?",
+        (guild.id, today.month, today.day),
+    ):
+        if birthday_template is None:
+            birthday_template = get_birthday_message_template(guild.id)
+        messages.append(birthday_template.replace("{member}", f"<@{user_id}>"))
+
+    event_template, days_before = get_event_reminder_settings(guild.id)
+    target_date = today + datetime.timedelta(days=days_before)
+
+    for name, notify_user_ids in conn.execute(
+        "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
+        "AND (year = ? OR year IS NULL)",
+        (guild.id, target_date.month, target_date.day, target_date.year),
+    ):
+        mention = notify_user_ids or ""
+        text = event_template.replace("{name}", name).replace("{days}", str(days_before))
+        if "{notify}" in text:
+            line = text.replace("{notify}", mention)
+        elif mention:
+            line = f"{text} {mention}"
+        else:
+            line = text
+        messages.append(line)
+
+    if messages:
+        await channel.send("\n".join(messages))
+    # Only mark today as done once sending actually succeeded (or there was
+    # nothing to send) — on failure, leave it unmarked so later ticks this
+    # same hour keep retrying instead of silently giving up for the day.
+    set_last_reminder_date(guild.id, today_str)
 
 
-@tasks.loop(time=datetime.time(hour=REMINDER_HOUR, tzinfo=ZoneInfo(TIMEZONE)))
+@tasks.loop(minutes=5)
 async def daily_check():
-    today = datetime.date.today()
+    now_local = datetime.datetime.now(ZoneInfo(TIMEZONE))
+    today = now_local.date()
+    today_str = today.isoformat()
     conn = get_db()
 
     for guild in bot.guilds:
-        channel_id = get_reminder_channel(guild.id)
-        if not channel_id:
+        if now_local.hour != get_reminder_hour(guild.id):
             continue
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            continue
+        if get_last_reminder_date(guild.id) == today_str:
+            continue  # already sent today's reminders for this guild
 
-        messages = []
-        birthday_template = None
-
-        for user_id, in conn.execute(
-            "SELECT user_id FROM birthdays WHERE guild_id = ? AND month = ? AND day = ?",
-            (guild.id, today.month, today.day),
-        ):
-            if birthday_template is None:
-                birthday_template = get_birthday_message_template(guild.id)
-            messages.append(birthday_template.replace("{member}", f"<@{user_id}>"))
-
-        event_template = None
-
-        for name, notify_user_ids in conn.execute(
-            "SELECT name, notify_user_ids FROM events WHERE guild_id = ? AND month = ? AND day = ? "
-            "AND (year = ? OR year IS NULL)",
-            (guild.id, today.month, today.day, today.year),
-        ):
-            if event_template is None:
-                event_template = get_event_reminder_template(guild.id)
-
-            mention = notify_user_ids or ""
-            text = event_template.replace("{name}", name)
-            if "{notify}" in text:
-                line = text.replace("{notify}", mention)
-            elif mention:
-                line = f"{text} {mention}"
-            else:
-                line = text
-            messages.append(line)
-
-        if messages:
-            await channel.send("\n".join(messages))
+        try:
+            await _send_guild_reminders(conn, guild, today, today_str)
+        except Exception:
+            # Never let one guild's failure (missing channel permissions, a
+            # deleted channel, etc.) kill the whole task — discord.py only
+            # auto-retries on low-level connection errors, so anything else
+            # here would otherwise silently stop reminders for every guild
+            # until the bot restarts.
+            print(f"Failed to send reminders for guild {guild.id} ({guild.name}):")
+            traceback.print_exc()
 
     conn.close()
 

@@ -23,7 +23,8 @@ cd birthday-bot
 pip install -r requirements.txt
 cp .env.example .env
 # edit .env: paste your token, set BOT_NAME to whatever custom name you want,
-# set your TIMEZONE and preferred REMINDER_HOUR
+# and set your TIMEZONE (the hour reminders post at is set later, per-server,
+# via /setreminderhour)
 python bot.py
 ```
 
@@ -37,9 +38,11 @@ display name instantly.)
 In any channel, run:
 ```
 /setchannel #general
+/setreminderhour hour:9
 ```
-(pick whatever channel you want reminders posted in — needs Manage Server
-permission to run)
+`/setchannel` picks where reminders post; `/setreminderhour` picks what hour
+(24h, per your `TIMEZONE`) they post at — defaults to 9am if you never set
+it. Both are per-server and both need Administrator permission to run.
 
 ## 5. Add birthdays and events
 ```
@@ -136,15 +139,28 @@ across every tracked event at once instead:
 ```
 
 ## 6. How reminders work
-Every day at `REMINDER_HOUR` (your local time, per `TIMEZONE`), the bot checks
-the database and posts to the configured channel:
+Every day at whatever hour you set via `/setreminderhour` (your local time,
+per `TIMEZONE`; defaults to 9am), the bot checks the database and posts to
+the configured channel:
 - `🎂 Happy Birthday @user!` for anyone whose birthday is today (customizable
   per-server via `/setbirthdaymessage template:"..."`, using `{member}`)
 - `📅 Reminder: <event> is today!` for any matching event, with whoever's
-  concerned tagged after it (customizable per-server via
-  `/seteventreminder template:"..."`, using `{name}` and optionally
-  `{notify}` — if you don't include `{notify}`, the mention is just appended
-  after your message automatically, same as the default)
+  concerned tagged after it. Customizable per-server via `/seteventreminder`:
+  ```
+  /seteventreminder template:"🚨 Heads up! **{name}** is happening {days} day(s) from now"
+  /seteventreminder days:3
+  /seteventreminder template:"..." days:3
+  ```
+  - `template` supports `{name}`, `{notify}`, and `{days}`. If you don't
+    include `{notify}`, the mention is just appended after your message
+    automatically, same as the default.
+  - `days` controls how far in advance the reminder fires — `0` (the
+    default) means "the same day the event happens"; `3` means "3 days
+    before." Either parameter can be set independently — passing just
+    `days` doesn't reset your custom message, and vice versa.
+  - The default message text automatically adapts based on `days` (a
+    same-day phrasing when `days:0`, an "in N day(s)" phrasing otherwise) —
+    that only applies as long as you haven't set a custom `template`.
 
 ## 7. Deploying to Railway
 1. **Push to GitHub.** `.env` is already listed in `.gitignore` — never
@@ -157,7 +173,7 @@ the database and posts to the configured channel:
    won't wait for an HTTP port to open (important: if it's misdetected as a
    "web" service, go to Settings and remove any exposed port / health check).
 3. **Set environment variables** — Settings -> Variables -> add each one from
-   your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`, `REMINDER_HOUR`.
+   your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`.
 4. **Add a Volume for persistence** (important — without this, `reminders.db`
    is wiped on every redeploy since Railway containers are stateless).
    Project -> **+ New -> Volume**, mount it at e.g. `/data`, then set the env

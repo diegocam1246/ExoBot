@@ -325,6 +325,7 @@ async def create_discord_scheduled_event(
             start_time=start,
             end_time=end,
             entity_type=discord.EntityType.external,
+            privacy_level=discord.PrivacyLevel.guild_only,
             location=location or "Not specified",
         )
         return scheduled_event.id, None

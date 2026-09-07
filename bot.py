@@ -189,7 +189,7 @@ def set_last_birthday_reminder_date(guild_id: int, date_str: str):
     conn.close()
 
 
-DEFAULT_BIRTHDAY_MESSAGE = "🎂 Happy Birthday {member}! 🎉"
+DEFAULT_BIRTHDAY_MESSAGE = "🎂 Joyeux anniversaire {member} ! 🎉"
 
 
 def get_birthday_message_template(guild_id: int) -> str:
@@ -201,8 +201,8 @@ def get_birthday_message_template(guild_id: int) -> str:
     return row[0] if row and row[0] else DEFAULT_BIRTHDAY_MESSAGE
 
 
-DEFAULT_EVENT_REMINDER_SAME_DAY = "📅 Reminder: **{name}** is today!"
-DEFAULT_EVENT_REMINDER_ADVANCE = "📅 Reminder: **{name}** is in {days} day(s)!"
+DEFAULT_EVENT_REMINDER_SAME_DAY = "📅 Rappel : **{name}** c'est aujourd'hui !"
+DEFAULT_EVENT_REMINDER_ADVANCE = "📅 Rappel : **{name}** dans {days} jour(s) !"
 
 
 def get_event_reminder_settings(guild_id: int) -> tuple[str, int]:
@@ -312,7 +312,7 @@ def discord_event_bounds(
 
 async def create_discord_scheduled_event(
     guild: discord.Guild, name: str, month: int, day: int, year: int,
-    time: str | None, duration: int | None, location: str | None,
+    time: str | None, duration: int | None, location: str | None, description: str | None,
 ) -> tuple[int | None, str | None]:
     """Creates a native Discord Scheduled Event for this event. Returns
     (event_id, None) on success, or (None, error message) on failure — e.g.
@@ -326,7 +326,8 @@ async def create_discord_scheduled_event(
             end_time=end,
             entity_type=discord.EntityType.external,
             privacy_level=discord.PrivacyLevel.guild_only,
-            location=location or "Not specified",
+            location=location or "Non spécifié",
+            description=description or discord.utils.MISSING,
         )
         return scheduled_event.id, None
     except discord.HTTPException as e:
@@ -347,7 +348,7 @@ async def delete_discord_scheduled_event(guild: discord.Guild, discord_event_id:
 
 def calendar_add_link(
     name: str, month: int, day: int, year: int, time: str | None = None,
-    duration: int | None = None, location: str | None = None,
+    duration: int | None = None, location: str | None = None, description: str | None = None,
 ) -> str:
     """Builds a generic Google Calendar 'quick add' URL for a single-date
     event. Clicking it lets ANY user (no login/API needed on our end) add
@@ -363,12 +364,14 @@ def calendar_add_link(
         params["dates"] = f"{start.strftime('%Y%m%dT%H%M%SZ')}/{end.strftime('%Y%m%dT%H%M%SZ')}"
     if location:
         params["location"] = location
+    if description:
+        params["details"] = description
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
 
 def build_ics_file(
     name: str, month: int, day: int, year: int, time: str | None = None,
-    duration: int | None = None, location: str | None = None,
+    duration: int | None = None, location: str | None = None, description: str | None = None,
 ) -> discord.File:
     """Builds a universal .ics calendar file for a single-date event (works
     with Google, Outlook, Apple Calendar, etc.) that anyone can download and
@@ -393,6 +396,8 @@ def build_ics_file(
     lines.append(f"SUMMARY:{name}")
     if location:
         lines.append(f"LOCATION:{location}")
+    if description:
+        lines.append(f"DESCRIPTION:{description}")
     lines += ["END:VEVENT", "END:VCALENDAR"]
     ics_bytes = ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
@@ -438,14 +443,14 @@ async def on_guild_join(guild: discord.Guild):
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "You need **Administrator** permission to do that.", ephemeral=True
+            "Vous devez avoir la permission **Administrateur** pour faire cela.", ephemeral=True
         )
         return
     # Fall back to logging anything unexpected instead of failing silently
     print(f"Unhandled app command error: {error}")
     if not interaction.response.is_done():
         await interaction.response.send_message(
-            "Something went wrong running that command.", ephemeral=True
+            "Une erreur s'est produite lors de l'exécution de cette commande.", ephemeral=True
         )
 
 
@@ -464,7 +469,7 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Reminders will now be posted in {channel.mention}.", ephemeral=True
+        f"Les rappels seront désormais publiés dans {channel.mention}.", ephemeral=True
     )
 
 
@@ -481,8 +486,8 @@ async def setreminderhour(interaction: discord.Interaction, hour: app_commands.R
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Event reminders will now post at {hour:02d}:00 ({TIMEZONE}). "
-        "(Birthday reminders use a separate fixed time — see BIRTHDAY_REMINDER_HOUR.)",
+        f"Les rappels d'événements seront désormais publiés à {hour:02d}:00 ({TIMEZONE}). "
+        "(Les rappels d'anniversaire utilisent une heure fixe distincte — voir BIRTHDAY_REMINDER_HOUR.)",
         ephemeral=True,
     )
 
@@ -502,7 +507,7 @@ async def setbirthday(
     try:
         datetime.date(2024, month, day)  # validate, 2024 = leap year so Feb 29 works
     except ValueError:
-        await interaction.response.send_message("That's not a real date.", ephemeral=True)
+        await interaction.response.send_message("Ce n'est pas une date valide.", ephemeral=True)
         return
 
     conn = get_db()
@@ -514,7 +519,7 @@ async def setbirthday(
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Saved {member.display_name}'s birthday as {month:02d}/{day:02d}."
+        f"Anniversaire de {member.display_name} enregistré : {month:02d}/{day:02d}."
     )
 
 
@@ -530,7 +535,7 @@ async def removebirthday(interaction: discord.Interaction, member: discord.Membe
     )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"Removed {target.display_name}'s birthday.")
+    await interaction.response.send_message(f"Anniversaire de {target.display_name} supprimé.")
 
 
 @bot.tree.command(description="Set the day-of birthday message (use {member})")
@@ -545,7 +550,7 @@ async def setbirthdaymessage(interaction: discord.Interaction, template: str):
     conn.commit()
     conn.close()
     await interaction.response.send_message(
-        f"Birthday messages will now use:\n> {template}", ephemeral=True
+        f"Les messages d'anniversaire utiliseront désormais :\n> {template}", ephemeral=True
     )
 
 
@@ -559,7 +564,7 @@ async def birthdays(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await interaction.response.send_message("No birthdays saved yet.")
+        await interaction.response.send_message("Aucun anniversaire enregistré pour le moment.")
         return
 
     today = datetime.date.today()
@@ -583,7 +588,7 @@ async def birthdays(interaction: discord.Interaction):
     for user_id, month, day in rows:
         member = interaction.guild.get_member(user_id)
         name = member.display_name if member else f"<@{user_id}>"
-        lines.append(f"**{name}** — {month:02d}/{day:02d} (in {days_until(month, day)} days)")
+        lines.append(f"**{name}** — {month:02d}/{day:02d} (dans {days_until(month, day)} jours)")
 
     await interaction.response.send_message("\n".join(lines))
 
@@ -599,17 +604,17 @@ async def exportbirthdays(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await interaction.response.send_message("No birthdays saved yet.", ephemeral=True)
+        await interaction.response.send_message("Aucun anniversaire enregistré pour le moment.", ephemeral=True)
         return
 
     csv_rows = []
     for user_id, month, day in rows:
         member = interaction.guild.get_member(user_id)
-        name = member.display_name if member else "(left server)"
+        name = member.display_name if member else "(a quitté le serveur)"
         csv_rows.append([name, user_id, month, day])
 
     file = build_csv_file(
-        "birthdays.csv", ["Member", "User ID", "Month", "Day"], csv_rows
+        "birthdays.csv", ["Membre", "ID utilisateur", "Mois", "Jour"], csv_rows
     )
     await interaction.response.send_message(file=file, ephemeral=True)
 
@@ -625,12 +630,12 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     try:
         data = json.loads((await file.read()).decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        await interaction.followup.send(f"Couldn't parse that file as JSON: {e}", ephemeral=True)
+        await interaction.followup.send(f"Impossible d'analyser ce fichier en tant que JSON : {e}", ephemeral=True)
         return
 
     if not isinstance(data, list):
         await interaction.followup.send(
-            'Expected a JSON array of {"user_id", "month", "day"} objects.', ephemeral=True
+            'Un tableau JSON d\'objets {"user_id", "month", "day"} était attendu.', ephemeral=True
         )
         return
 
@@ -644,7 +649,7 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
             day = int(entry["day"])
             datetime.date(2024, month, day)  # validate, 2024 = leap year so Feb 29 works
         except (KeyError, TypeError, ValueError):
-            errors.append(f"Entry {i}: invalid or missing user_id/month/day")
+            errors.append(f"Entrée {i} : user_id/month/day invalide ou manquant")
             continue
         conn.execute(
             "INSERT INTO birthdays (guild_id, user_id, month, day) VALUES (?, ?, ?, ?) "
@@ -655,12 +660,12 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     conn.commit()
     conn.close()
 
-    summary = f"Imported {imported} birthday(s)."
+    summary = f"{imported} anniversaire(s) importé(s)."
     if errors:
         shown = errors[:10]
         summary += "\n" + "\n".join(shown)
         if len(errors) > 10:
-            summary += f"\n...and {len(errors) - 10} more errors."
+            summary += f"\n...et {len(errors) - 10} erreur(s) de plus."
     await interaction.followup.send(summary, ephemeral=True)
 
 
@@ -676,6 +681,7 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     time="Optional start time, 24h format HH:MM (defaults to an all-day event)",
     duration="Duration in minutes, only used with time (defaults to 60)",
     location="Optional location",
+    description="Optional description",
     notify="@mention the members/roles this event concerns",
 )
 @app_commands.checks.has_permissions(administrator=True)
@@ -688,6 +694,7 @@ async def addevent(
     time: str = None,
     duration: int = None,
     location: str = None,
+    description: str = None,
     notify: str = None,
 ):
     year = year or datetime.date.today().year
@@ -695,7 +702,7 @@ async def addevent(
     try:
         datetime.date(year, month, day)
     except ValueError:
-        await interaction.response.send_message("That's not a real date.", ephemeral=True)
+        await interaction.response.send_message("Ce n'est pas une date valide.", ephemeral=True)
         return
 
     if time is not None:
@@ -703,13 +710,13 @@ async def addevent(
             parse_event_time(time)
         except ValueError:
             await interaction.response.send_message(
-                "Time must be in 24h HH:MM format, e.g. 14:30.", ephemeral=True
+                "L'heure doit être au format 24h HH:MM, par ex. 14:30.", ephemeral=True
             )
             return
 
     if duration is not None and duration < 1:
         await interaction.response.send_message(
-            "Duration must be a positive number of minutes.", ephemeral=True
+            "La durée doit être un nombre de minutes positif.", ephemeral=True
         )
         return
 
@@ -717,7 +724,7 @@ async def addevent(
 
     notify_tokens = extract_mention_tokens(notify)
     discord_event_id, discord_event_error = await create_discord_scheduled_event(
-        interaction.guild, name, month, day, year, time, duration, location
+        interaction.guild, name, month, day, year, time, duration, location, description
     )
 
     conn = get_db()
@@ -733,28 +740,37 @@ async def addevent(
     conn.commit()
     conn.close()
 
-    link = calendar_add_link(name, month, day, year, time=time, duration=duration, location=location)
+    link = calendar_add_link(
+        name, month, day, year, time=time, duration=duration, location=location, description=description
+    )
 
-    reply = f"New event added (#{event_id})! If you wish to add it to your calendar, click on this link: {link}"
+    reply = f"Nouvel événement ajouté (#{event_id}) ! Pour l'ajouter à votre calendrier, cliquez sur ce lien : {link}"
     if discord_event_id:
-        reply += "\n📌 Also created as a Discord Scheduled Event (see your server's Events tab)."
+        reply += "\n📌 Également créé en tant qu'événement Discord programmé (voir l'onglet Événements de votre serveur)."
     else:
-        reply += f"\n⚠️ Couldn't create a Discord Scheduled Event: {discord_event_error}"
+        reply += f"\n⚠️ Impossible de créer un événement Discord programmé : {discord_event_error}"
     await interaction.followup.send(
         reply,
-        file=build_ics_file(name, month, day, year, time=time, duration=duration, location=location),
+        file=build_ics_file(
+            name, month, day, year, time=time, duration=duration, location=location, description=description
+        ),
     )
 
     channel_id = get_reminder_channel(interaction.guild_id)
     if channel_id:
         channel = interaction.guild.get_channel(channel_id)
         if channel:
-            text = f"📢 New event: **{name}**"
+            text = f"📢 Oyé! Oyé! Annonce d'un nouvel événement : **{name}**"
+            if description:
+                text += f"\n{description}"
             if notify:
                 text += f" {notify}"
-            text += f"\n➕ [Add to your calendar]({link})"
+            text += f"\n➕ [Ajoutez-le à votre calendrier]({link})"
             await channel.send(
-                text, file=build_ics_file(name, month, day, year, time=time, duration=duration, location=location)
+                text,
+                file=build_ics_file(
+                    name, month, day, year, time=time, duration=duration, location=location, description=description
+                ),
             )
 
 
@@ -768,7 +784,7 @@ async def notifyevent(interaction: discord.Interaction, event_id: int, notify: s
     tokens = extract_mention_tokens(notify)
     if not tokens:
         await interaction.response.send_message(
-            "Couldn't find any @mentions in that — make sure to actually @-mention the members/roles.",
+            "Aucune mention @ trouvée — assurez-vous de bien mentionner les membres/rôles avec @.",
             ephemeral=True,
         )
         return
@@ -779,7 +795,7 @@ async def notifyevent(interaction: discord.Interaction, event_id: int, notify: s
     ).fetchone()
     if not row:
         conn.close()
-        await interaction.response.send_message(f"No event with ID #{event_id}.", ephemeral=True)
+        await interaction.response.send_message(f"Aucun événement avec l'ID #{event_id}.", ephemeral=True)
         return
 
     conn.execute(
@@ -789,7 +805,7 @@ async def notifyevent(interaction: discord.Interaction, event_id: int, notify: s
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message(f"Event #{event_id} will now notify: {' '.join(tokens)}")
+    await interaction.response.send_message(f"L'événement #{event_id} notifiera désormais : {' '.join(tokens)}")
 
 
 @bot.tree.command(description="Add a member/role to every tracked event's notify list (Administrator only)")
@@ -799,7 +815,7 @@ async def addmentionall(interaction: discord.Interaction, notify: str):
     add_tokens = set(extract_mention_tokens(notify))
     if not add_tokens:
         await interaction.response.send_message(
-            "Couldn't find any @mentions in that.", ephemeral=True
+            "Aucune mention @ trouvée.", ephemeral=True
         )
         return
 
@@ -818,7 +834,7 @@ async def addmentionall(interaction: discord.Interaction, notify: str):
     conn.close()
 
     mentions = " ".join(add_tokens)
-    await interaction.response.send_message(f"Added {mentions} to {len(rows)} event(s).")
+    await interaction.response.send_message(f"{mentions} ajouté(s) à {len(rows)} événement(s).")
 
 
 @bot.tree.command(description="Remove a member/role from every tracked event's notify list (Admin only)")
@@ -828,7 +844,7 @@ async def removementionall(interaction: discord.Interaction, notify: str):
     remove_tokens = set(extract_mention_tokens(notify))
     if not remove_tokens:
         await interaction.response.send_message(
-            "Couldn't find any @mentions in that.", ephemeral=True
+            "Aucune mention @ trouvée.", ephemeral=True
         )
         return
 
@@ -851,8 +867,8 @@ async def removementionall(interaction: discord.Interaction, notify: str):
 
     mentions = " ".join(remove_tokens)
     await interaction.response.send_message(
-        f"Removed {mentions} from {changed} event(s). Any event left with an empty list will "
-        "no longer tag anyone in its day-of reminder."
+        f"{mentions} retiré(s) de {changed} événement(s). Tout événement dont la liste devient vide "
+        "ne mentionnera plus personne dans son rappel du jour même."
     )
 
 
@@ -865,13 +881,13 @@ async def removementionall(interaction: discord.Interaction, notify: str):
 async def seteventreminder(interaction: discord.Interaction, template: str = None, days: int = None):
     if template is None and days is None:
         await interaction.response.send_message(
-            "Provide at least one of template or days.", ephemeral=True
+            "Veuillez fournir au moins un des deux : template ou days.", ephemeral=True
         )
         return
 
     if days is not None and days < 0:
         await interaction.response.send_message(
-            "Days must be zero or a positive number.", ephemeral=True
+            "Le nombre de jours doit être zéro ou un nombre positif.", ephemeral=True
         )
         return
 
@@ -888,10 +904,10 @@ async def seteventreminder(interaction: discord.Interaction, template: str = Non
 
     parts = []
     if template is not None:
-        parts.append(f"message:\n> {template}")
+        parts.append(f"message :\n> {template}")
     if days is not None:
-        parts.append(f"reminding {days} day(s) before the event" if days else "reminding on the same day")
-    await interaction.response.send_message("Updated event reminders — " + "; ".join(parts), ephemeral=True)
+        parts.append(f"rappel {days} jour(s) avant l'événement" if days else "rappel le jour même")
+    await interaction.response.send_message("Rappels d'événements mis à jour — " + "; ".join(parts), ephemeral=True)
 
 
 @bot.tree.command(description="Remove an event by its listed ID (see /events)")
@@ -913,7 +929,7 @@ async def removeevent(interaction: discord.Interaction, event_id: int):
     if row and row[0]:
         await delete_discord_scheduled_event(interaction.guild, row[0])
 
-    await interaction.followup.send(f"Removed event #{event_id}.")
+    await interaction.followup.send(f"Événement #{event_id} supprimé.")
 
 
 @bot.tree.command(description="List all upcoming events")
@@ -926,7 +942,7 @@ async def events(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await interaction.response.send_message("No events saved yet.")
+        await interaction.response.send_message("Aucun événement enregistré pour le moment.")
         return
 
     today = datetime.date.today()
@@ -942,10 +958,10 @@ async def events(interaction: discord.Interaction):
 
     entries.sort()
     lines = [
-        f"`#{eid}` **{name}** — {d.strftime('%Y-%m-%d')} (in {(d - today).days} days)"
+        f"`#{eid}` **{name}** — {d.strftime('%Y-%m-%d')} (dans {(d - today).days} jours)"
         for d, eid, name in entries
     ]
-    await interaction.response.send_message("\n".join(lines) if lines else "No upcoming events.")
+    await interaction.response.send_message("\n".join(lines) if lines else "Aucun événement à venir.")
 
 
 @bot.tree.command(description="Export all saved events as a CSV file (Administrator only)")
@@ -960,13 +976,13 @@ async def exportevents(interaction: discord.Interaction):
     conn.close()
 
     if not rows:
-        await interaction.response.send_message("No events saved yet.", ephemeral=True)
+        await interaction.response.send_message("Aucun événement enregistré pour le moment.", ephemeral=True)
         return
 
     csv_rows = []
     for event_id, name, month, day, year, created_by, notify_user_ids in rows:
         creator = interaction.guild.get_member(created_by)
-        creator_name = creator.display_name if creator else "(left server)"
+        creator_name = creator.display_name if creator else "(a quitté le serveur)"
         notify_names = [
             describe_mention_token(interaction.guild, tok)
             for tok in extract_mention_tokens(notify_user_ids)
@@ -977,7 +993,7 @@ async def exportevents(interaction: discord.Interaction):
 
     file = build_csv_file(
         "events.csv",
-        ["ID", "Name", "Month", "Day", "Year", "Created By", "Created By User ID", "Notify"],
+        ["ID", "Nom", "Mois", "Jour", "Année", "Créé par", "ID utilisateur du créateur", "Notifier"],
         csv_rows,
     )
     await interaction.response.send_message(file=file, ephemeral=True)
@@ -994,12 +1010,12 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
     try:
         data = json.loads((await file.read()).decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        await interaction.followup.send(f"Couldn't parse that file as JSON: {e}", ephemeral=True)
+        await interaction.followup.send(f"Impossible d'analyser ce fichier en tant que JSON : {e}", ephemeral=True)
         return
 
     if not isinstance(data, list):
         await interaction.followup.send(
-            'Expected a JSON array of {"name", "month", "day"} objects.', ephemeral=True
+            'Un tableau JSON d\'objets {"name", "month", "day"} était attendu.', ephemeral=True
         )
         return
 
@@ -1014,7 +1030,7 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
             year = int(entry["year"]) if entry.get("year") else datetime.date.today().year
             datetime.date(year, month, day)  # validate
         except (KeyError, TypeError, ValueError):
-            errors.append(f"Entry {i}: invalid or missing name/month/day/year")
+            errors.append(f"Entrée {i} : name/month/day/year invalide ou manquant")
             continue
         notify_tokens = extract_mention_tokens(entry.get("notify"))
         conn.execute(
@@ -1029,12 +1045,12 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
     conn.commit()
     conn.close()
 
-    summary = f"Imported {imported} event(s)."
+    summary = f"{imported} événement(s) importé(s)."
     if errors:
         shown = errors[:10]
         summary += "\n" + "\n".join(shown)
         if len(errors) > 10:
-            summary += f"\n...and {len(errors) - 10} more errors."
+            summary += f"\n...et {len(errors) - 10} erreur(s) de plus."
     await interaction.followup.send(summary, ephemeral=True)
 
 

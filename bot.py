@@ -439,11 +439,26 @@ async def on_guild_join(guild: discord.Guild):
         pass
 
 
+def has_admin_or_role(role_name: str):
+    """Command check: allows Administrators, or anyone holding a role whose
+    name matches role_name (case-insensitive)."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        return any(role.name.lower() == role_name.lower() for role in interaction.user.roles)
+    return app_commands.check(predicate)
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "Vous devez avoir la permission **Administrateur** pour faire cela.", ephemeral=True
+        )
+        return
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(
+            "Vous n'avez pas la permission nécessaire pour faire cela.", ephemeral=True
         )
         return
     # Fall back to logging anything unexpected instead of failing silently
@@ -684,7 +699,7 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     description="Optional description",
     notify="@mention the members/roles this event concerns",
 )
-@app_commands.checks.has_permissions(administrator=True)
+@has_admin_or_role("Chef")
 async def addevent(
     interaction: discord.Interaction,
     name: str,

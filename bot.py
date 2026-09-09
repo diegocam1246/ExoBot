@@ -43,10 +43,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 load_dotenv()
 
@@ -58,29 +54,6 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "reminder
 # hour for every guild — unlike event reminders, which are per-guild
 # configurable via /setreminderhour.
 BIRTHDAY_REMINDER_HOUR = int(os.getenv("BIRTHDAY_REMINDER_HOUR", "9"))
-
-# Google Calendar (optional — if not configured, calendar features are skipped)
-# Maps a friendly team name to its Google Calendar ID, e.g.:
-# {"Chefs": "abc@group.calendar.google.com", "Énergie": "..."}
-try:
-    GOOGLE_CALENDARS = json.loads(os.getenv("GOOGLE_CALENDARS") or "{}")
-except json.JSONDecodeError:
-    print("GOOGLE_CALENDARS is not valid JSON — calendar features disabled.")
-    GOOGLE_CALENDARS = {}
-
-# Choices shown in the /addevent calendar dropdown; falls back to a single
-# placeholder if no calendars are configured, since Discord requires at
-# least one choice.
-CALENDAR_CHOICES = [
-    app_commands.Choice(name=k, value=k) for k in GOOGLE_CALENDARS.keys()
-] or [app_commands.Choice(name="(no calendars configured)", value="")]
-
-# The full serialized OAuth credentials (client id/secret, refresh token,
-# etc.) produced by the one-time local authorize_google.py script — this is
-# a real Google account's own credentials (whoever ran that script), not a
-# separate service-account identity, so normal calendar sharing/edit rights
-# apply with no external-sharing restrictions or admin console access needed.
-GOOGLE_OAUTH_TOKEN_JSON = os.getenv("GOOGLE_OAUTH_TOKEN_JSON")
 
 INTENTS = discord.Intents.default()
 INTENTS.members = True  # needed to fetch member display names
@@ -335,76 +308,6 @@ def discord_event_bounds(
     ).astimezone(datetime.timezone.utc)
     end = start + datetime.timedelta(minutes=duration or DISCORD_EVENT_DEFAULT_DURATION_MINUTES)
     return start, end
-
-
-# ---------------------------------------------------------------------------
-# Google Calendar integration (optional) — authenticated via OAuth as a real
-# Google account (see authorize_google.py), not a service account, so normal
-# calendar sharing/edit rights apply with no admin console access needed.
-# ---------------------------------------------------------------------------
-_calendar_service = None
-_calendar_checked = False
-
-
-def get_calendar_service():
-    """Lazily builds and caches the Google Calendar API client from the
-    stored OAuth credentials. Returns None (calendar features silently
-    no-op) if not configured. Refreshes the access token automatically using
-    the stored refresh token when it's expired."""
-    global _calendar_service, _calendar_checked
-    if _calendar_checked:
-        return _calendar_service
-    _calendar_checked = True
-
-    if not GOOGLE_CALENDARS or not GOOGLE_OAUTH_TOKEN_JSON:
-        print("Google Calendar not configured — skipping calendar event creation.")
-        return None
-
-    try:
-        info = json.loads(GOOGLE_OAUTH_TOKEN_JSON)
-        creds = Credentials.from_authorized_user_info(
-            info, scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(GoogleAuthRequest())
-        _calendar_service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        print(f"Failed to initialize Google Calendar client: {e}")
-        _calendar_service = None
-
-    return _calendar_service
-
-
-def create_calendar_event(
-    calendar_id: str | None, name: str, month: int, day: int, year: int,
-    time: str | None, duration: int | None, location: str | None, description: str | None,
-) -> tuple[str | None, str | None]:
-    """Creates the event directly on the given team calendar. Returns
-    (calendar_link, error_message) — calendar_link is None if calendar
-    integration isn't configured, no calendar was picked, or the call
-    fails (error_message explains why in that last case)."""
-    service = get_calendar_service()
-    if service is None or not calendar_id:
-        return None, None
-
-    is_all_day, start, end = event_datetime_bounds(month, day, year, time, duration)
-    body = {"summary": name}
-    if is_all_day:
-        body["start"] = {"date": start.strftime("%Y-%m-%d")}
-        body["end"] = {"date": end.strftime("%Y-%m-%d")}
-    else:
-        body["start"] = {"dateTime": start.isoformat()}
-        body["end"] = {"dateTime": end.isoformat()}
-    if location:
-        body["location"] = location
-    if description:
-        body["description"] = description
-
-    try:
-        created = service.events().insert(calendarId=calendar_id, body=body).execute()
-        return created.get("htmlLink"), None
-    except HttpError as e:
-        return None, str(e)
 
 
 async def create_discord_scheduled_event(
@@ -789,7 +692,6 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     name="What the event is",
     month="1-12",
     day="1-31",
-    calendar="Which team calendar to add this event to directly",
     year="Leave empty to use the current year",
     time="Optional start time, 24h format HH:MM (defaults to an all-day event)",
     duration="Duration in minutes, only used with time (defaults to 60)",
@@ -797,14 +699,12 @@ async def importbirthdays(interaction: discord.Interaction, file: discord.Attach
     description="Optional description",
     notify="@mention the members/roles this event concerns",
 )
-@app_commands.choices(calendar=CALENDAR_CHOICES)
 @has_admin_or_role("Chef")
 async def addevent(
     interaction: discord.Interaction,
     name: str,
     month: app_commands.Range[int, 1, 12],
     day: app_commands.Range[int, 1, 31],
-    calendar: app_commands.Choice[str],
     year: int = None,
     time: str = None,
     duration: int = None,
@@ -835,17 +735,11 @@ async def addevent(
         )
         return
 
-    await interaction.response.defer()  # creating the calendar/Discord events are API calls, may take a moment
-
-    calendar_key = calendar.value or None
-    calendar_id = GOOGLE_CALENDARS.get(calendar_key) if calendar_key else None
+    await interaction.response.defer()  # creating the Discord event is an API call, may take a moment
 
     notify_tokens = extract_mention_tokens(notify)
     discord_event_id, discord_event_error = await create_discord_scheduled_event(
         interaction.guild, name, month, day, year, time, duration, location, description
-    )
-    calendar_link, calendar_error = create_calendar_event(
-        calendar_id, name, month, day, year, time, duration, location, description
     )
 
     conn = get_db()
@@ -861,18 +755,11 @@ async def addevent(
     conn.commit()
     conn.close()
 
-    personal_link = calendar_add_link(
+    link = calendar_add_link(
         name, month, day, year, time=time, duration=duration, location=location, description=description
     )
 
-    reply = (
-        f"Nouvel événement ajouté (#{event_id}) ! Pour l'ajouter à votre calendrier, "
-        f"cliquez sur ce lien : {personal_link}"
-    )
-    if calendar_link:
-        reply += f"\n📅 Également ajouté directement au calendrier **{calendar_key}** : {calendar_link}"
-    elif calendar_id:
-        reply += f"\n⚠️ Impossible d'ajouter l'événement au calendrier **{calendar_key}** : {calendar_error}"
+    reply = f"Nouvel événement ajouté (#{event_id}) ! Pour l'ajouter à votre calendrier, cliquez sur ce lien : {link}"
     if discord_event_id:
         reply += "\n📌 Également créé en tant qu'événement Discord programmé (voir l'onglet Événements de votre serveur)."
     else:
@@ -893,9 +780,7 @@ async def addevent(
                 text += f"\n{description}"
             if notify:
                 text += f" {notify}"
-            text += f"\n➕ [Ajoutez-le à votre calendrier]({personal_link})"
-            if calendar_link:
-                text += f"\n📅 [Voir sur le calendrier {calendar_key}]({calendar_link})"
+            text += f"\n➕ [Ajoutez-le à votre calendrier]({link})"
             await channel.send(
                 text,
                 file=build_ics_file(

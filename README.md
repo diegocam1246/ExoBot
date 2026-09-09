@@ -63,43 +63,33 @@ Customize the day-of birthday message per-server (defaults to
 ```
 
 ```
-/addevent name:"Team standup" month:9 day:10 calendar:Chefs notify:"@Chefs"   (uses the current year)
-/addevent name:"Anniversary" month:9 day:10 calendar:Général year:2027
-/addevent name:"Kickoff meeting" month:9 day:20 calendar:Mécanique time:14:30 duration:90 location:"Room A-201" notify:"@Alice @Bob"
+/addevent name:"Team standup" month:9 day:10 notify:"@Chefs"        (uses the current year)
+/addevent name:"Anniversary" month:9 day:10 year:2027
+/addevent name:"Kickoff meeting" month:9 day:20 time:14:30 duration:90 location:"Room A-201" notify:"@Alice @Bob"
 /events
 /removeevent event_id:12
 ```
 
-Every event is saved **locally in the bot's own database** right away (so it
-shows up in `/events` and gets a day-of Discord reminder — see below), and
-`/addevent`:
-1. `calendar` (required) picks which team calendar to add the event to
-   directly — if Google Calendar integration is set up (see below), the bot
-   creates the real event there immediately, no manual step needed.
-2. Also replies with a generic **Google Calendar quick-add link** — clicking
-   it lets anyone add the same event to whichever of *their own* calendars
-   they choose (personal or otherwise), independent of the direct add above.
+Everything about events is stored **locally in the bot's own database** —
+there's no Google Calendar API integration at all, so nothing needs to be
+shared/synced with an external account. `/addevent`:
+1. Saves the event locally right away (so it shows up in `/events` and gets
+   a day-of Discord reminder — see below).
+2. Replies with a generic **Google Calendar quick-add link** — clicking it
+   opens the normal "Create event" panel pre-filled with the name/date/time,
+   letting whoever opens it add it to whichever of *their own* calendars
+   they choose (personal or a shared one they have access to). The bot
+   itself never touches Google Calendar's API — this is just a plain URL,
+   no auth needed.
 3. Also attaches a universal `.ics` file (works with Google, Outlook, Apple
-   Calendar, etc.) as another alternative.
-4. Posts an announcement (with both links) to the channel set via
-   `/setchannel`, tagging whatever you passed in `notify`.
-5. Also creates a native **Discord Scheduled Event** (visible in your
-   server's Events tab).
-
-If Google Calendar integration isn't set up, step 1 is silently skipped —
-everything else still works, and `calendar` just becomes a label with no
-real calendar behind it yet.
+   Calendar, etc.) as an alternative to the link.
+4. Posts the same announcement + link to the channel set via `/setchannel`,
+   tagging whatever you passed in `notify`.
 
 `/addevent` always creates a single-date event (no repeating/annual option)
 — `year` is optional and just defaults to the current year if left out, it
 doesn't mean "repeat every year." `time` (24h `HH:MM`), `duration` (minutes,
-only relevant with `time`, defaults to 60), `location`, and `description` are
-all optional.
-
-`/removeevent event_id:12` only removes the bot's local tracking (and the
-Discord Scheduled Event, if one was created) — it does **not** delete the
-real Google Calendar event, which needs to be removed by hand if you don't
-want it lingering there.
+only relevant with `time`, defaults to 60), and `location` are all optional.
 
 `/removeevent event_id:12` deletes an event from the bot's local tracking
 (its ID comes from `/events`) — this is now the only way to remove one,
@@ -152,47 +142,7 @@ across every tracked event at once instead:
 /removementionall notify:"@Alice"     (removes her from every event's list)
 ```
 
-## 6. Set up Google Calendar integration (optional)
-`/addevent` can create the real event directly on one of your team calendars
-if you set this up — without it, `calendar` is just a label and the bot
-falls back to the generic link/`.ics` file only.
-
-This uses **OAuth as a real Google account** (whoever already has edit
-access to your team calendars), not a separate service-account identity —
-so it only needs whatever access that account already has. No Google
-Workspace admin console access is required.
-
-1. Go to https://console.cloud.google.com/ and create a project (or reuse one).
-2. **APIs & Services -> Library** -> search "Google Calendar API" -> Enable.
-3. **APIs & Services -> Credentials -> Create Credentials -> OAuth client ID**.
-   - If asked, configure the OAuth consent screen first — User type
-     "External" is fine; fill in the required fields and add yourself as a
-     test user. It stays unpublished/private, which is fine for this.
-   - Application type: **Desktop app**.
-4. Download the credential (the "Download JSON" button) and save it as
-   `client_secret.json` next to `bot.py`.
-5. Run `python authorize_google.py` **on your own computer** (not on
-   Railway) — this only needs to happen once, ever (unless the resulting
-   access is later revoked). It installs nothing extra beyond what's already
-   in `requirements.txt`. A browser window opens; sign in as whichever
-   Google account already has edit access to your team calendars, and click
-   Allow.
-6. The script prints a JSON blob — copy it and set it as the
-   `GOOGLE_OAUTH_TOKEN_JSON` variable in `.env` (locally) or on Railway.
-7. For each team calendar's **Calendar ID** (Google Calendar -> that
-   calendar's Settings and sharing -> Integrate calendar -> Calendar ID),
-   set `GOOGLE_CALENDARS` to a JSON object mapping each team's display name
-   (exactly what you want to show up in the `/addevent` dropdown) to its ID:
-   ```
-   GOOGLE_CALENDARS={"Chefs":"abc1@group.calendar.google.com","Embarqué":"abc2@group.calendar.google.com","Général":"abc3@group.calendar.google.com","Mécanique":"abc4@group.calendar.google.com","Énergie":"abc5@group.calendar.google.com","Birthdays":"abc6@group.calendar.google.com"}
-   ```
-
-If either `GOOGLE_CALENDARS` or `GOOGLE_OAUTH_TOKEN_JSON` isn't set, calendar
-features are silently skipped — everything else keeps working. Adding a new
-team later is just adding one more entry to that JSON object, no code
-changes needed.
-
-## 7. How reminders work
+## 6. How reminders work
 The bot checks the database every few minutes and posts to the configured
 channel once per day per category — birthdays and events are timed
 independently, and can post at different times of day:
@@ -220,10 +170,9 @@ independently, and can post at different times of day:
     same-day phrasing when `days:0`, an "in N day(s)" phrasing otherwise) —
     that only applies as long as you haven't set a custom `template`.
 
-## 8. Deploying to Railway
-1. **Push to GitHub.** `.env`, `client_secret.json`, and `token.json` are
-   already listed in `.gitignore` — never commit any of them (they're
-   credentials). Only commit `bot.py`, `authorize_google.py`,
+## 7. Deploying to Railway
+1. **Push to GitHub.** `.env` is already listed in `.gitignore` — never
+   commit it (it holds your bot token). Only commit `bot.py`,
    `requirements.txt`, `Procfile`, `.gitignore`, `README.md`.
 2. **Create a project** at https://railway.app -> **New Project -> Deploy
    from GitHub repo** -> pick this repo. Railway auto-detects it's Python
@@ -233,10 +182,7 @@ independently, and can post at different times of day:
    "web" service, go to Settings and remove any exposed port / health check).
 3. **Set environment variables** — Settings -> Variables -> add each one from
    your local `.env`: `DISCORD_TOKEN`, `BOT_NAME`, `TIMEZONE`,
-   `BIRTHDAY_REMINDER_HOUR` (optional, defaults to 9), and if using Calendar
-   integration: `GOOGLE_CALENDARS` + `GOOGLE_OAUTH_TOKEN_JSON` (the JSON blob
-   printed by `authorize_google.py` — paste it as-is, Railway's Variables
-   tab accepts raw JSON directly).
+   `BIRTHDAY_REMINDER_HOUR` (optional, defaults to 9).
 4. **Add a Volume for persistence** (important — without this, `reminders.db`
    is wiped on every redeploy since Railway containers are stateless).
    Project -> **+ New -> Volume**, mount it at e.g. `/data`, then set the env

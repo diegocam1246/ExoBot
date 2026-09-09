@@ -775,18 +775,37 @@ async def addevent(
     if channel_id:
         channel = interaction.guild.get_channel(channel_id)
         if channel:
+            # Mentions only actually ping when they're in the plain message
+            # content (not an embed), so keep content to just the header +
+            # notify pings and put the free-form description/link in an
+            # embed instead — its description allows up to 4096 chars vs.
+            # content's 2000, which is what was causing long event
+            # descriptions to blow past Discord's limit (HTTPException
+            # 50035: "Must be 2000 or fewer in length").
             text = f"📢 Oyé! Oyé! Annonce d'un nouvel événement : **{name}**"
-            if description:
-                text += f"\n{description}"
             if notify:
                 text += f" {notify}"
-            text += f"\n➕ [Ajoutez-le à votre calendrier]({link})"
-            await channel.send(
-                text,
-                file=build_ics_file(
-                    name, month, day, year, time=time, duration=duration, location=location, description=description
-                ),
-            )
+            text = text[:2000]
+
+            embed_lines = []
+            if description:
+                embed_lines.append(description)
+            embed_lines.append(f"➕ [Ajoutez-le à votre calendrier]({link})")
+            embed = discord.Embed(description="\n".join(embed_lines)[:4096])
+
+            try:
+                await channel.send(
+                    text,
+                    embed=embed,
+                    file=build_ics_file(
+                        name, month, day, year, time=time, duration=duration, location=location, description=description
+                    ),
+                )
+            except discord.HTTPException as e:
+                print(f"Failed to post event announcement to channel {channel_id}: {e}")
+                await interaction.followup.send(
+                    f"⚠️ Impossible de publier l'annonce dans le salon configuré : {e}", ephemeral=True
+                )
 
 
 @bot.tree.command(description="Set who gets @mentioned for an existing event (replaces the list)")

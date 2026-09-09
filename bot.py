@@ -710,7 +710,7 @@ async def addevent(
     time: str = None,
     duration: int = None,
     location: str = None,
-    description: str = None,
+    description: app_commands.Range[str, None, 4096] = None,
     notify: str = None,
 ):
     year = year or datetime.date.today().year
@@ -1092,7 +1092,7 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
 @bot.tree.command(description="Flip a coin")
 async def coinflip(interaction: discord.Interaction):
     result = secrets.choice(["Pile", "Face"])
-    await interaction.response.send_message(f"🪙 {result} !")
+    await interaction.response.send_message(f"{result}!")
 
 
 # ---------------------------------------------------------------------------

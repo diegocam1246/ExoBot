@@ -33,6 +33,7 @@ import io
 import csv
 import json
 import re
+import secrets
 import sqlite3
 import datetime
 import traceback
@@ -1086,6 +1087,12 @@ async def importevents(interaction: discord.Interaction, file: discord.Attachmen
         if len(errors) > 10:
             summary += f"\n...et {len(errors) - 10} erreur(s) de plus."
     await interaction.followup.send(summary, ephemeral=True)
+
+
+@bot.tree.command(description="Flip a coin")
+async def coinflip(interaction: discord.Interaction):
+    result = secrets.choice(["Pile", "Face"])
+    await interaction.response.send_message(f"🪙 {result} !")
 
 
 # ---------------------------------------------------------------------------
